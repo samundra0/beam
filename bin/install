@@ -1,0 +1,30 @@
+#!/bin/sh
+# Install this checkout into the Omarchy shell, for development. Everyone else
+# uses `omarchy plugin add <repo-url> --enable`, which clones into the same
+# place. The shell refuses symlinked plugins, so the files are copied; saving
+# them there hot-reloads the plugin.
+set -eu
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+PLUGINS="$HOME/.config/omarchy/plugins"
+DEST="$PLUGINS/beam.cast"
+
+omarchy plugin validate "$ROOT"
+
+# Earlier versions installed into plugins/beam; two copies would claim one id.
+if [ -f "$PLUGINS/beam/manifest.json" ] && grep -q '"beam.cast"' "$PLUGINS/beam/manifest.json"; then
+  rm -rf "$PLUGINS/beam"
+fi
+
+mkdir -p "$DEST"
+for f in beamctl Panel.qml manifest.json LICENSE README.md; do
+  cp "$ROOT/$f" "$DEST/$f"
+done
+rm -rf "$DEST/i18n"
+cp -r "$ROOT/i18n" "$DEST/i18n"
+chmod +x "$DEST/beamctl"
+
+omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+if ! omarchy plugin list --json | jq -e '.[] | select(.id == "beam.cast" and .enabled == true)' >/dev/null 2>&1; then
+  omarchy plugin enable beam.cast right || true
+fi
+echo "Installed Beam to $DEST"

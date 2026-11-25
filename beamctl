@@ -1,0 +1,728 @@
+#!/usr/bin/env python3
+"""beamctl: the helper behind the Beam bar widget.
+
+Finds AirPlay screens on the local network, checks that this machine can cast
+to them, and starts or stops a doubletake mirroring session. Every command
+prints one JSON object on stdout, so the QML side never parses free text.
+
+Commands:
+  discover [--all]             list AirPlay screens with the port that answers RTSP
+                               (--all also lists audio-only receivers such as speakers)
+  doctor                       check packages, services, firewall and the doubletake binary
+  fix                          open a terminal that runs the fix commands doctor suggests
+  install-doubletake           download the pinned doubletake release into ~/.local/lib/beam
+  setup                        install doubletake, then run the fix commands here (asks for sudo)
+  start HOST PORT [options]    start casting (--device-id ID --name NAME --audio --no-cursor --code PIN)
+  stop                         stop the cast and put the previous sound output back
+  status                       what is casting now, read from the process and its log
+"""
+
+import concurrent.futures
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")), "beam")
+LOG_PATH = os.path.join(STATE_DIR, "cast.log")
+SESSION_PATH = os.path.join(STATE_DIR, "session.json")
+LIB_DIR = os.path.join(HOME, ".local/lib/beam")
+PLUGIN_DIR = os.path.dirname(os.path.realpath(__file__))
+
+# doubletake listens for the receiver's timing and audio traffic on these UDP
+# ports, so the firewall rule only has to open this one small range.
+PORT_RANGE = "60000-60010"
+UFW_RANGE = "60000:60010"
+PRIVATE_NETS = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
+DOUBLETAKE_VERSION = "v0.6.0"
+DOUBLETAKE_BASE = f"https://github.com/omarroth/doubletake/releases/download/{DOUBLETAKE_VERSION}/"
+# Release asset and SHA-256 per machine, from the release's SHA256SUMS.
+DOUBLETAKE_ASSETS = {
+    "x86_64": ("doubletake", "01fb6c7b9de6f3bd693a629e248fe61ceb7af06353c8f3f21cc29878d1f9f5de"),
+    "aarch64": ("doubletake-arm64", "8c2713f122fcee11e3fb358a381d30e661d1e72faf6be919b93ffba7d2a35a85"),
+}
+LICENSE_URL = f"https://raw.githubusercontent.com/omarroth/doubletake/{DOUBLETAKE_VERSION}/LICENSE"
+LICENSE_SHA256 = "e3a994d82e644b03a792a930f574002658412f62407f5fee083f2555c5f23118"
+
+REQUIRED_PACKAGES = [
+    "gstreamer", "gst-plugins-base", "gst-plugins-good", "gst-plugins-bad",
+    "gst-plugins-ugly", "gst-libav", "gst-plugin-pipewire", "gst-plugin-va",
+    "libpulse", "avahi",
+]
+OPTIONAL_PACKAGES = ["libfdk-aac"]  # AAC-ELD sound; doubletake falls back to ALAC without it
+
+
+def emit(obj, code=0):
+    print(json.dumps(obj))
+    sys.exit(code)
+
+
+def run(cmd, timeout=10):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, "", str(e)
+
+
+# ----------------------------------------------------------------- discovery
+
+def avahi_unescape(text):
+    """avahi-browse -p writes non-alphanumeric bytes as \\DDD (decimal)."""
+    raw = re.sub(r"\\(\d{3})", lambda m: chr(int(m.group(1))), text)
+    try:
+        return raw.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return raw
+
+
+def parse_txt(fields):
+    txt = {}
+    for item in re.findall(r'"((?:[^"\\]|\\.)*)"', ";".join(fields)):
+        if "=" in item:
+            k, v = item.split("=", 1)
+            txt[k.lower()] = v
+    return txt
+
+
+def parse_avahi_line(line):
+    """One resolved `=` line from `avahi-browse -rp`, or None."""
+    if not line.startswith("="):
+        return None
+    f = line.rstrip("\n").split(";")
+    if len(f) < 9:
+        return None
+    try:
+        port = int(f[8])
+    except ValueError:
+        return None
+    return {
+        # = ; iface ; proto ; name ; type ; domain ; hostname ; address ; port ; txt
+        "iface": f[1], "proto": f[2], "name": avahi_unescape(f[3]), "type": f[4],
+        "host": f[6], "address": f[7], "port": port,
+        "txt": parse_txt(f[9:]) if len(f) > 9 else {},
+    }
+
+
+def group_receivers(airplay, raop):
+    """Merge _airplay._tcp and _raop._tcp records into one entry per device.
+
+    Legacy receivers (Horion panels among them) advertise the HTTP AirPlay
+    service and the RTSP mirroring service on different ports, so every
+    advertised port becomes a candidate and the probe picks the one that
+    answers RTSP.
+    """
+    devices = {}
+
+    def entry(key):
+        return devices.setdefault(key, {"deviceId": "", "name": "", "model": "", "host": "",
+                                        "raopPort": None, "airplayPort": None, "features": ""})
+
+    def better_host(cur, new):
+        if not new:
+            return cur
+        if not cur:
+            return new
+        # IPv4 wins, then anything that is not link-local IPv6.
+        if ":" in cur and ":" not in new:
+            return new
+        return cur
+
+    for r in airplay:
+        did = r["txt"].get("deviceid", "").upper() or r["name"]
+        d = entry(did)
+        d["deviceId"] = r["txt"].get("deviceid", "").upper()
+        d["name"] = r["name"]
+        d["model"] = r["txt"].get("model", d["model"])
+        d["features"] = r["txt"].get("features", d.get("features", ""))
+        if d["airplayPort"] is None or ":" not in r["address"]:
+            d["airplayPort"] = r["port"]
+        d["host"] = better_host(d["host"], r["address"])
+    for r in raop:
+        prefix, _, name = r["name"].partition("@")
+        mac = ":".join(prefix[i:i + 2] for i in range(0, len(prefix), 2)) if re.fullmatch(r"[0-9A-Fa-f]{12}", prefix) else prefix
+        did = mac.upper() if name else r["name"]
+        d = entry(did)
+        if not d["deviceId"] and name:
+            d["deviceId"] = did
+        if not d["name"]:
+            d["name"] = name or r["name"]
+        if not d["model"]:
+            d["model"] = r["txt"].get("am", "")
+        if d["raopPort"] is None or ":" not in r["address"]:
+            d["raopPort"] = r["port"]
+        d["host"] = better_host(d["host"], r["address"])
+
+    out = []
+    for d in devices.values():
+        cands = []
+        for p in (d["raopPort"], d["airplayPort"], 7000):
+            if p and p not in cands:
+                cands.append(p)
+        d["candidates"] = cands
+        d["screen"] = is_screen(d)
+        out.append(d)
+    return sorted(out, key=lambda d: d["name"].lower())
+
+
+# Models that only ever play sound: HomePods and AirPort Express base stations.
+AUDIO_ONLY_MODELS = ("AudioAccessory", "AirPort")
+
+
+def is_screen(d):
+    """Whether a receiver can show a mirrored screen, judged from what it advertises.
+
+    Speakers advertise AirPlay too. A receiver without an _airplay._tcp record
+    is RAOP-only (sound); Apple's speakers are known by model; and anything
+    else that advertises features without bit 7 (screen mirroring) can't take
+    a mirror stream. Unknown receivers are kept rather than hidden.
+    """
+    if d.get("airplayPort") is None:
+        return False
+    if d.get("model", "").startswith(AUDIO_ONLY_MODELS):
+        return False
+    features = d.get("features", "")
+    if features:
+        try:
+            low = int(features.split(",")[0], 16)
+        except ValueError:
+            return True
+        return bool(low & (1 << 7))
+    return True
+
+
+def probe_rtsp(host, port, timeout=1.5):
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            s.sendall(b"GET /info RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: AirPlay/220.68\r\n\r\n")
+            head = s.recv(64)
+        return head.startswith(b"RTSP/1.0 200")
+    except OSError:
+        return False
+
+
+def browse(service, timeout=8):
+    code, out, _ = run(["avahi-browse", "-rptk", service], timeout=timeout)
+    return [r for r in (parse_avahi_line(l) for l in out.splitlines()) if r]
+
+
+def network_info():
+    info = {"iface": "", "ssid": "", "ip": ""}
+    code, out, _ = run(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "dev"], timeout=4)
+    for line in out.splitlines():
+        parts = line.split(":", 3)
+        if len(parts) == 4 and parts[1] == "wifi" and parts[2] == "connected":
+            info["iface"], info["ssid"] = parts[0], parts[3].replace("\\:", ":")
+            break
+    if not info["iface"]:
+        # Wired, or Wi-Fi not managed by NetworkManager: the default route's
+        # interface is the network the screens are on.
+        code, out, _ = run(["ip", "-4", "route", "show", "default"], timeout=3)
+        m = re.search(r"\bdev (\S+)", out)
+        if m:
+            info["iface"] = m.group(1)
+    if info["iface"]:
+        code, out, _ = run(["ip", "-4", "-o", "addr", "show", "dev", info["iface"]], timeout=3)
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
+        if m:
+            info["ip"] = m.group(1)
+    return info
+
+
+def cmd_discover(show_all=False):
+    with concurrent.futures.ThreadPoolExecutor(4) as pool:
+        fa = pool.submit(browse, "_airplay._tcp")
+        fr = pool.submit(browse, "_raop._tcp")
+        fn = pool.submit(network_info)
+        devices = [d for d in group_receivers(fa.result(), fr.result()) if show_all or d["screen"]]
+
+        def resolve(d):
+            d["port"], d["reachable"] = (d["candidates"][0] if d["candidates"] else 7000), False
+            if d["host"]:
+                for p in d["candidates"]:
+                    if probe_rtsp(d["host"], p):
+                        d["port"], d["reachable"] = p, True
+                        break
+            return d
+
+        devices = list(pool.map(resolve, devices))
+        net = fn.result()
+    for d in devices:
+        for k in ("raopPort", "airplayPort", "features"):
+            d.pop(k, None)
+    emit({"ok": True, "network": net, "devices": devices})
+
+
+# -------------------------------------------------------------------- doctor
+
+def find_doubletake():
+    env = os.environ.get("BEAM_DOUBLETAKE")
+    for path in [env, os.path.join(PLUGIN_DIR, "doubletake"), os.path.join(LIB_DIR, "doubletake"),
+                 shutil.which("doubletake")]:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return ""
+
+
+def missing_packages(names):
+    code, out, err = run(["pacman", "-Q"] + names)
+    return re.findall(r"package '([^']+)' was not found", err)
+
+
+def ufw_enabled():
+    try:
+        with open("/etc/ufw/ufw.conf") as f:
+            if re.search(r"^\s*ENABLED\s*=\s*yes", f.read(), re.M):
+                return True
+    except OSError:
+        pass
+    code, out, _ = run(["systemctl", "is-active", "ufw"], timeout=3)
+    return out.strip() == "active"
+
+
+def ufw_allows(rules_text, ip):
+    """True when a ufw user rule opens UDP 60000:60010 to traffic from ip."""
+    if not ip:
+        return False
+    addr = ipaddress.ip_address(ip)
+    for line in rules_text.splitlines():
+        m = re.match(r"### tuple ### allow (udp|any) (\S+) (\S+) (\S+) (\S+) in", line)
+        if not m:
+            continue
+        dport, src = m.group(2), m.group(5)
+        ports = dport.replace(",", " ").split()
+        covered = False
+        for p in ports:
+            lo, _, hi = p.partition(":")
+            try:
+                lo, hi = int(lo), int(hi or lo)
+            except ValueError:
+                continue
+            if lo <= 60000 and hi >= 60010:
+                covered = True
+        if dport == "any":
+            covered = True
+        if not covered:
+            continue
+        try:
+            if addr in ipaddress.ip_network(src, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def doctor():
+    checks = []
+    fixes = []
+
+    dt = find_doubletake()
+    checks.append({"id": "doubletake", "ok": bool(dt), "label": "doubletake",
+                   "detail": dt or "Not installed. Use Install doubletake."})
+
+    missing = missing_packages(REQUIRED_PACKAGES)
+    checks.append({"id": "packages", "ok": not missing, "label": "GStreamer and audio packages",
+                   "detail": "Missing: " + " ".join(missing) if missing else "Installed"})
+    if missing:
+        fixes.append("sudo pacman -S --needed " + " ".join(missing))
+
+    opt = missing_packages(OPTIONAL_PACKAGES)
+    checks.append({"id": "aac", "ok": not opt, "optional": True, "label": "AAC sound (optional)",
+                   "detail": "Missing libfdk-aac; sound falls back to ALAC" if opt else "Installed"})
+
+    code, out, _ = run(["systemctl", "is-active", "avahi-daemon"], timeout=3)
+    avahi_ok = out.strip() == "active"
+    checks.append({"id": "avahi", "ok": avahi_ok, "label": "Screen discovery (avahi)",
+                   "detail": "Running" if avahi_ok else "avahi-daemon is not running"})
+    if not avahi_ok:
+        fixes.append("sudo systemctl enable --now avahi-daemon")
+
+    net = network_info()
+    if ufw_enabled():
+        try:
+            with open("/etc/ufw/user.rules") as f:
+                rules = f.read()
+            readable = True
+        except OSError:
+            rules, readable = "", False
+        fw_ok = ufw_allows(rules, net["ip"]) if readable else False
+        detail = ("UDP 60000-60010 open for this network" if fw_ok else
+                  "ufw blocks the screen's replies on UDP 60000-60010" if net["ip"] else
+                  "Not connected to a network; can't check the rule for it")
+        checks.append({"id": "firewall", "ok": fw_ok, "label": "Firewall", "detail": detail})
+        if not fw_ok:
+            fixes.extend(f"sudo ufw allow from {n} to any port {UFW_RANGE} proto udp" for n in PRIVATE_NETS)
+    else:
+        checks.append({"id": "firewall", "ok": True, "label": "Firewall", "detail": "ufw is off"})
+
+    ok = all(c["ok"] for c in checks if not c.get("optional"))
+    return {"ok": ok, "network": net, "checks": checks, "fixes": fixes,
+            "fixScript": " && ".join(fixes)}
+
+
+def cmd_doctor():
+    emit(doctor())
+
+
+def cmd_fix():
+    d = doctor()
+    if not d["fixes"]:
+        emit({"ok": True, "launched": False, "message": "Nothing to fix"})
+    script = "set -e; " + "; ".join(d["fixes"]) + "; echo; echo 'Beam: setup fixed.'"
+    launcher = shutil.which("omarchy-launch-floating-terminal-with-presentation")
+    if launcher:
+        cmd = [launcher, "bash -c " + shlex_quote(script)]
+    else:
+        cmd = ["xdg-terminal-exec", "bash", "-c", script + "; read -rp 'Press Enter to close'"]
+    subprocess.Popen(cmd, start_new_session=True, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    emit({"ok": True, "launched": True, "commands": d["fixes"]})
+
+
+def shlex_quote(s):
+    import shlex
+    return shlex.quote(s)
+
+
+def download(url, dest, sha256):
+    tmp = dest + ".part"
+    h = hashlib.sha256()
+    with urllib.request.urlopen(url, timeout=60) as r, open(tmp, "wb") as f:
+        total = 0
+        while True:
+            chunk = r.read(1 << 16)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > 64 << 20:
+                raise ValueError("download larger than 64 MB")
+            h.update(chunk)
+            f.write(chunk)
+    if h.hexdigest() != sha256:
+        os.unlink(tmp)
+        raise ValueError(f"checksum mismatch for {url}")
+    os.replace(tmp, dest)
+
+
+def install_doubletake():
+    """Download the pinned doubletake for this machine; returns its path or raises."""
+    machine = os.uname().machine
+    if machine not in DOUBLETAKE_ASSETS:
+        raise ValueError(f"doubletake has no release build for {machine}; build it from source")
+    asset, sha256 = DOUBLETAKE_ASSETS[machine]
+    os.makedirs(LIB_DIR, exist_ok=True)
+    dest = os.path.join(LIB_DIR, "doubletake")
+    download(DOUBLETAKE_BASE + asset, dest, sha256)
+    os.chmod(dest, 0o755)
+    download(LICENSE_URL, os.path.join(LIB_DIR, "LICENSE.doubletake"), LICENSE_SHA256)
+    return dest
+
+
+def cmd_install_doubletake():
+    try:
+        dest = install_doubletake()
+    except Exception as e:  # network, checksum, disk, unsupported machine
+        emit({"ok": False, "error": str(e)}, 1)
+    emit({"ok": True, "path": dest, "version": DOUBLETAKE_VERSION})
+
+
+def cmd_setup():
+    """Everything a new machine needs, in the terminal it was run from.
+
+    Human-readable rather than JSON: this is the one command people type.
+    """
+    if not find_doubletake():
+        print(f"Downloading doubletake {DOUBLETAKE_VERSION} into {LIB_DIR} ...")
+        try:
+            print("  installed", install_doubletake())
+        except Exception as e:
+            print("  failed:", e)
+            sys.exit(1)
+    d = doctor()
+    for cmd in d["fixes"]:
+        print("+", cmd)
+        if subprocess.call(cmd, shell=True) != 0:
+            print("Failed:", cmd)
+            sys.exit(1)
+    d = doctor()
+    for c in d["checks"]:
+        mark = "ok " if c["ok"] else ("-- " if c.get("optional") else "!! ")
+        print(f"{mark} {c['label']}: {c['detail']}")
+    print("Ready to cast." if d["ok"] else "Some checks still fail; see above.")
+    sys.exit(0 if d["ok"] else 1)
+
+
+# ------------------------------------------------------------------- session
+
+def read_session():
+    try:
+        with open(SESSION_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_session(data):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = SESSION_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, SESSION_PATH)
+
+
+def proc_cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+    except OSError:
+        return []
+
+
+def is_doubletake(pid):
+    args = proc_cmdline(pid)
+    return bool(args) and os.path.basename(args[0]) == "doubletake"
+
+
+def doubletake_processes():
+    out = []
+    # doubletake forks a helper with the same argv0 (--internal-audio-output-guard);
+    # it exits with its parent, so only the casting process counts.
+    for name in os.listdir("/proc"):
+        if name.isdigit() and is_doubletake(int(name)):
+            if not any(a.startswith("--internal") for a in proc_cmdline(int(name))):
+                out.append(int(name))
+    return out
+
+
+def arg_value(args, flag):
+    for i, a in enumerate(args):
+        if a in (flag, "-" + flag) and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith(flag + "=") or a.startswith("-" + flag + "="):
+            return a.split("=", 1)[1]
+    return ""
+
+
+ERROR_RE = re.compile(r"error|failed|fatal|panic|refused|timed? ?out|no route|unreachable", re.I)
+
+
+def log_state(text):
+    """Map doubletake's log to a cast phase, the last error, and whether it wants a PIN."""
+    lines = [l for l in text.splitlines() if l.strip()]
+    state = "connecting"
+    for l in lines:
+        if "connected to:" in l:
+            state = "pairing"
+        if "mirror session ready" in l:
+            state = "live"
+    ended = any(("stream ended" in l or "shutting down" in l) for l in lines)
+    needs_code = bool(re.search(r"Enter the (PIN|code)|run again with -pair", text))
+    last_error = ""
+    for l in reversed(lines):
+        if ERROR_RE.search(l):
+            last_error = re.sub(r"^\d{4}/\d\d/\d\d \d\d:\d\d:\d\d ", "", l).strip()[:300]
+            break
+    return {"phase": state, "ended": ended, "needsCode": needs_code, "lastError": last_error}
+
+
+def tail(path, n=40):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 64 * 1024))
+            data = f.read().decode(errors="replace")
+    except OSError:
+        return ""
+    return "\n".join(data.splitlines()[-n:])
+
+
+def cmd_status():
+    sess = read_session()
+    pid = sess.get("pid")
+    ours = bool(pid) and is_doubletake(pid)
+    log = tail(LOG_PATH, 200) if sess else ""
+    info = log_state(log) if log else {"phase": "idle", "ended": False, "needsCode": False, "lastError": ""}
+
+    if ours:
+        state = info["phase"]
+        emit({"ok": True, "state": state, "external": False, "pid": pid,
+              "name": sess.get("name", ""), "host": sess.get("host", ""), "port": sess.get("port"),
+              "audio": sess.get("audio", False), "needsCode": info["needsCode"],
+              "lastError": info["lastError"], "log": "\n".join(log.splitlines()[-30:])})
+
+    failed = bool(sess and log and not info["ended"] and (info["lastError"] or info["needsCode"]))
+    recent = time.time() - float(sess.get("startedAt", 0) or 0) < 120
+
+    # A doubletake someone started by hand (or from a terminal) still counts:
+    # the widget shows it as live so the user knows the screen is in use. A
+    # cast of ours that just failed is still the more useful thing to show.
+    others = doubletake_processes()
+    if others and not (failed and recent):
+        args = proc_cmdline(others[0])
+        emit({"ok": True, "state": "live", "external": True, "pid": others[0], "name": "",
+              "host": arg_value(args, "-target"), "port": int(arg_value(args, "-port") or 7000),
+              "audio": "-no-audio" not in args, "needsCode": False, "lastError": "", "log": ""})
+
+    state = "failed" if failed else "idle"
+    emit({"ok": True, "state": state, "external": False, "pid": None,
+          "name": sess.get("name", ""), "host": sess.get("host", ""), "port": sess.get("port"),
+          "audio": False, "needsCode": info["needsCode"] if state == "failed" else False,
+          "lastError": info["lastError"] if state == "failed" else "",
+          "log": "\n".join(log.splitlines()[-30:])})
+
+
+def cmd_start(argv):
+    import argparse
+    ap = argparse.ArgumentParser(prog="beamctl start")
+    ap.add_argument("host")
+    ap.add_argument("port", type=int)
+    ap.add_argument("--device-id", default="")
+    ap.add_argument("--name", default="")
+    ap.add_argument("--audio", action="store_true")
+    ap.add_argument("--no-cursor", action="store_true")
+    ap.add_argument("--code", default="")
+    a = ap.parse_args(argv)
+
+    try:
+        ipaddress.ip_address(a.host)
+    except ValueError:
+        if not re.fullmatch(r"[A-Za-z0-9.-]{1,253}", a.host):
+            emit({"ok": False, "error": "invalid host"}, 1)
+    if not 1 <= a.port <= 65535:
+        emit({"ok": False, "error": "invalid port"}, 1)
+    if a.device_id and not re.fullmatch(r"[0-9A-Fa-f:]{11,17}", a.device_id):
+        a.device_id = ""
+
+    dt = find_doubletake()
+    if not dt:
+        emit({"ok": False, "error": "doubletake is not installed"}, 1)
+
+    sess = read_session()
+    if sess.get("pid") and is_doubletake(sess["pid"]):
+        emit({"ok": False, "error": "already casting", "pid": sess["pid"]}, 1)
+
+    args = [dt, "-target", a.host, "-port", str(a.port), "-port-range", PORT_RANGE]
+    if a.device_id:
+        args += ["-device-id", a.device_id.upper()]
+    args += ["-audio-source", "output"] if a.audio else ["-no-audio"]
+    if a.no_cursor:
+        args.append("-no-cursor")
+    if a.code:
+        args.append("-pair")
+
+    env = dict(os.environ)
+    if a.code:
+        env["DOUBLETAKE_CODE"] = a.code
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    logf = open(LOG_PATH, "w")
+    # A new session keeps the cast alive when the shell reloads its plugins.
+    p = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
+                         env=env, start_new_session=True)
+    logf.close()
+
+    prev_sink = ""
+    if a.audio:
+        code, out, _ = run(["pactl", "get-default-sink"], timeout=3)
+        prev_sink = out.strip() if code == 0 else ""
+    write_session({"pid": p.pid, "host": a.host, "port": a.port, "name": a.name,
+                   "deviceId": a.device_id, "audio": a.audio, "prevSink": prev_sink,
+                   "startedAt": time.time()})
+
+    if a.audio:
+        subprocess.Popen([sys.executable, os.path.realpath(__file__), "_route-audio", str(p.pid)],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    emit({"ok": True, "pid": p.pid, "args": args[1:]})
+
+
+def cmd_route_audio(pid):
+    """Wait for doubletake's sink, then make it the default output."""
+    deadline = time.time() + 45
+    while time.time() < deadline and is_doubletake(pid):
+        if "[AUDIO] select output doubletake" in tail(LOG_PATH, 200):
+            run(["pactl", "set-default-sink", "doubletake"], timeout=3)
+            return
+        time.sleep(0.5)
+
+
+def restore_sink(prev):
+    if not prev or prev == "doubletake":
+        return
+    code, out, _ = run(["pactl", "list", "short", "sinks"], timeout=3)
+    if any(line.split("\t")[1:2] == [prev] for line in out.splitlines()):
+        run(["pactl", "set-default-sink", prev], timeout=3)
+
+
+def wait_exit(pid, seconds):
+    end = time.time() + seconds
+    while time.time() < end:
+        if not is_doubletake(pid):
+            return True
+        time.sleep(0.1)
+    return not is_doubletake(pid)
+
+
+def cmd_stop():
+    sess = read_session()
+    pids = [sess["pid"]] if sess.get("pid") and is_doubletake(sess["pid"]) else doubletake_processes()
+    if not pids:
+        restore_sink(sess.get("prevSink", ""))
+        emit({"ok": True, "stopped": False, "message": "Nothing is casting"})
+    for pid in pids:
+        for sig, wait in ((signal.SIGINT, 5), (signal.SIGTERM, 3), (signal.SIGKILL, 2)):
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                break
+            if wait_exit(pid, wait):
+                break
+    restore_sink(sess.get("prevSink", ""))
+    if sess:
+        sess["pid"] = None
+        write_session(sess)
+    emit({"ok": True, "stopped": True, "pids": pids})
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "discover":
+        cmd_discover("--all" in rest)
+    elif cmd == "doctor":
+        cmd_doctor()
+    elif cmd == "fix":
+        cmd_fix()
+    elif cmd == "install-doubletake":
+        cmd_install_doubletake()
+    elif cmd == "setup":
+        cmd_setup()
+    elif cmd == "start":
+        cmd_start(rest)
+    elif cmd == "stop":
+        cmd_stop()
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "_route-audio" and rest:
+        cmd_route_audio(int(rest[0]))
+    else:
+        emit({"ok": False, "error": f"unknown command {cmd}"}, 2)
+
+
+if __name__ == "__main__":
+    main()

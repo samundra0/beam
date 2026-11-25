@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "beam.cast",
+  "name": "Beam",
+  "version": "0.1.0",
+  "author": "Samundra Raj Bajracharya",
+  "license": "MIT",
+  "description": "Mirror your screen to any AirPlay screen (Apple TV, AirPlay TVs, meeting-room panels) from the Omarchy bar, using doubletake.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Beam",
+    "description": "Find AirPlay screens, cast to one, and stop casting.",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "sound": true,
+      "cursor": true
+    },
+    "schema": [
+      { "key": "sound", "type": "boolean", "label": "Send sound to the screen", "defaultValue": true },
+      { "key": "cursor", "type": "boolean", "label": "Show the mouse cursor", "defaultValue": true }
+    ]
+  }
+}
