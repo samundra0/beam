@@ -18,13 +18,15 @@ On Omarchy:
 omarchy plugin add https://github.com/samundra0/beam.git --enable
 ```
 
-Then click the cast icon in the bar. The **Setup** section lists anything
-missing:
+Then click the cast icon in the bar. If anything is missing, the **Setup**
+section lists it with one button, **Set up Beam**, which opens a terminal that:
 
-- **Install doubletake** downloads the pinned doubletake release for your
-  machine (x86-64 or ARM64) into `~/.local/lib/beam/` and checks its SHA-256.
-- **Fix in terminal** opens a terminal running only the `sudo` commands that
-  are needed (see below).
+- downloads the pinned doubletake release for your machine (x86-64 or ARM64)
+  into `~/.local/lib/beam/` and checks its SHA-256;
+- runs only the `sudo` commands that are needed (see below), recording each
+  change so uninstall can undo it.
+
+The panel clears the warnings by itself when setup finishes.
 
 Prefer the terminal? This does both in one go:
 

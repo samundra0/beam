@@ -355,7 +355,7 @@ def doctor():
 
     dt = find_doubletake()
     checks.append({"id": "doubletake", "ok": bool(dt), "label": "doubletake",
-                   "detail": dt or "Not installed. Use Install doubletake."})
+                   "detail": dt or "Not installed yet; Set up Beam downloads it."})
 
     missing = missing_packages(REQUIRED_PACKAGES)
     checks.append({"id": "packages", "ok": not missing, "label": "GStreamer and audio packages",
@@ -423,7 +423,7 @@ def open_terminal(command):
 
 def cmd_fix():
     d = doctor()
-    if not d["fixes"]:
+    if d["ok"]:
         emit({"ok": True, "launched": False, "message": "Nothing to fix"})
     # setup runs the same fixes and records them, so uninstall can undo them.
     open_terminal(["setup"])

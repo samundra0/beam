@@ -23,7 +23,7 @@ Panel {
   property var fixes: []
   property bool doctorOk: true
   property bool discovering: false
-  property bool installing: false
+  property bool settingUp: false
   property string actionError: ""
   property string pendingAction: ""
   property var status: ({ state: "idle" })
@@ -43,11 +43,6 @@ Panel {
     return String(status.name || "") || host
   }
   readonly property var firewall: status.firewall || ({})
-  readonly property bool doubletakeMissing: {
-    for (var i = 0; i < checks.length; i++)
-      if (checks[i].id === "doubletake" && !checks[i].ok) return true
-    return false
-  }
 
   Commons.Translations { id: strings; directory: Qt.resolvedUrl("i18n") }
 
@@ -182,10 +177,25 @@ Panel {
       }
     }
     onExited: {
-      root.installing = false
       root.pendingAction = ""
       root.refreshStatus()
       root.refreshDoctor()
+    }
+  }
+
+  // While the setup terminal is open, recheck so the warnings clear by
+  // themselves when it finishes (or give up after five minutes).
+  Timer {
+    id: setupPoll
+    interval: 3000
+    repeat: true
+    running: root.settingUp
+    property int ticks: 0
+    onRunningChanged: ticks = 0
+    onTriggered: {
+      ticks++
+      root.refreshDoctor()
+      if (root.doctorOk || ticks > 100) root.settingUp = false
     }
   }
 
@@ -423,22 +433,17 @@ Panel {
 
           Row {
             spacing: Style.space(8)
+            // One button for everything setup needs: it opens a terminal that
+            // downloads doubletake and runs the sudo steps, recording each
+            // change for uninstall. The panel rechecks while it runs.
             Button {
-              visible: root.fixes.length > 0
-              text: strings.t("setup.fix")
+              text: root.settingUp ? strings.t("setup.running") : strings.t("setup.run")
+              enabled: !actionProc.running
+              active: true
               foreground: root.bar.foreground
               fontFamily: root.bar.fontFamily
               bordered: true
-              onClicked: root.runAction(["fix"])
-            }
-            Button {
-              visible: root.doubletakeMissing
-              text: root.installing ? strings.t("setup.installing") : strings.t("setup.install")
-              enabled: !root.installing
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
-              bordered: true
-              onClicked: { root.installing = true; root.runAction(["install-doubletake"]) }
+              onClicked: { root.settingUp = true; root.runAction(["fix"]) }
             }
             Button {
               text: strings.t("setup.recheck")

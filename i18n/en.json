@@ -11,9 +11,6 @@
   "network.wifi": "Wi-Fi: %1 · %2",
   "network.none": "Not connected. Join the screen's hotspot or network.",
   "setup.header": "Setup",
-  "setup.fix": "Fix in terminal",
-  "setup.install": "Install doubletake",
-  "setup.installing": "Downloading…",
   "setup.recheck": "Check again",
   "screens.header": "Screens",
   "screens.rescan": "Look for screens again",
@@ -39,5 +36,7 @@
   "options.askSource": "Ask what to share each time",
   "screens.choose": "Source…",
   "state.changingSource": "Reconnecting… pick what to share",
-  "uninstall": "Uninstall Beam…"
+  "uninstall": "Uninstall Beam…",
+  "setup.run": "Set up Beam",
+  "setup.running": "Setting up… finish in the terminal"
 }
