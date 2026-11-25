@@ -14,6 +14,7 @@ Commands:
   setup                        install doubletake, then run the fix commands here (asks for sudo)
   start HOST PORT [options]    start casting (--device-id ID --name NAME --audio --no-cursor --code PIN)
   stop                         stop the cast and put the previous sound output back
+  firewall-close               remove the firewall rule a cast opened (asks for your password)
   status                       what is casting now, read from the process and its log
 """
 
@@ -35,14 +36,17 @@ HOME = os.path.expanduser("~")
 STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")), "beam")
 LOG_PATH = os.path.join(STATE_DIR, "cast.log")
 SESSION_PATH = os.path.join(STATE_DIR, "session.json")
+FIREWALL_PATH = os.path.join(STATE_DIR, "firewall.json")
+UFW_RULES = "/etc/ufw/user.rules"  # world-readable, so rules can be checked without root
 LIB_DIR = os.path.join(HOME, ".local/lib/beam")
 PLUGIN_DIR = os.path.dirname(os.path.realpath(__file__))
 
 # doubletake listens for the receiver's timing and audio traffic on these UDP
-# ports, so the firewall rule only has to open this one small range.
+# ports, so the firewall rule only has to open this one small range. With ufw
+# on, Beam opens it for the one screen being cast to, only while casting, and
+# asks for the password through polkit both to open and to close it.
 PORT_RANGE = "60000-60010"
 UFW_RANGE = "60000:60010"
-PRIVATE_NETS = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
 
 DOUBLETAKE_VERSION = "v0.6.0"
 DOUBLETAKE_BASE = f"https://github.com/omarroth/doubletake/releases/download/{DOUBLETAKE_VERSION}/"
@@ -350,19 +354,21 @@ def doctor():
 
     net = network_info()
     if ufw_enabled():
-        try:
-            with open("/etc/ufw/user.rules") as f:
-                rules = f.read()
-            readable = True
-        except OSError:
-            rules, readable = "", False
-        fw_ok = ufw_allows(rules, net["ip"]) if readable else False
-        detail = ("UDP 60000-60010 open for this network" if fw_ok else
-                  "ufw blocks the screen's replies on UDP 60000-60010" if net["ip"] else
-                  "Not connected to a network; can't check the rule for it")
-        checks.append({"id": "firewall", "ok": fw_ok, "label": "Firewall", "detail": detail})
+        rules = read_rules()
+        readable = bool(rules) or os.access(UFW_RULES, os.R_OK)
+        permanent = readable and ufw_allows(rules, net["ip"])
+        pkexec = bool(shutil.which("pkexec")) and bool(ufw_path())
+        if permanent:
+            fw_ok, detail = True, ("UDP 60000-60010 is open permanently for this network. Beam doesn't "
+                                   "need that rule; it opens the port per cast.")
+        elif pkexec:
+            fw_ok, detail = True, "Opened for the screen only while casting; asks for your password"
+        else:
+            fw_ok, detail = False, "ufw is on and pkexec is missing, so Beam can't open the port per cast"
+        checks.append({"id": "firewall", "ok": fw_ok, "label": "Firewall", "detail": detail,
+                       "permanent": permanent})
         if not fw_ok:
-            fixes.extend(f"sudo ufw allow from {n} to any port {UFW_RANGE} proto udp" for n in PRIVATE_NETS)
+            fixes.append("sudo pacman -S --needed polkit")
     else:
         checks.append({"id": "firewall", "ok": True, "label": "Firewall", "detail": "ufw is off"})
 
@@ -463,6 +469,150 @@ def cmd_setup():
     sys.exit(0 if d["ok"] else 1)
 
 
+# ------------------------------------------------------------------ firewall
+
+def ufw_path():
+    return shutil.which("ufw") or ("/usr/bin/ufw" if os.path.exists("/usr/bin/ufw") else "")
+
+
+def read_rules():
+    try:
+        with open(UFW_RULES) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def rule_for_host(rules_text, host):
+    """True when ufw has exactly Beam's per-cast rule for host."""
+    want = re.compile(r"### tuple ### allow udp " + re.escape(UFW_RANGE) + r" \S+ any "
+                      + re.escape(host) + r"(/32)? in\b")
+    return any(want.match(l) for l in rules_text.splitlines())
+
+
+def ufw_rule(host):
+    return ["allow", "from", host, "to", "any", "port", UFW_RANGE, "proto", "udp"]
+
+
+def read_firewall():
+    try:
+        with open(FIREWALL_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_firewall(data):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if not data:
+        try:
+            os.unlink(FIREWALL_PATH)
+        except FileNotFoundError:
+            pass
+        return
+    tmp = FIREWALL_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, FIREWALL_PATH)
+
+
+def pkexec_ufw(args):
+    """Run ufw as root through polkit; Omarchy's shell shows the password dialog."""
+    pk, ufw = shutil.which("pkexec"), ufw_path()
+    if not pk or not ufw:
+        return 127, "pkexec or ufw is missing"
+    try:
+        r = subprocess.run([pk, ufw] + args, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        return 124, "password dialog timed out"
+    msg = (r.stdout + r.stderr).strip()
+    if r.returncode in (126, 127) and not msg:
+        msg = "password dialog dismissed"
+    return r.returncode, msg
+
+
+def firewall_open(host):
+    """Let the screen at host reach UDP 60000-60010 while casting.
+
+    Returns (ok, message). Nothing to do when ufw is off or a rule (Beam's own
+    from an earlier cast, or a permanent one) already lets the screen in.
+    """
+    if not ufw_enabled():
+        return True, "ufw is off"
+    rules = read_rules()
+    if ufw_allows(rules, host):
+        state = read_firewall()
+        if state.get("host") == host:
+            return True, "already open from an earlier cast"
+        return True, "an existing rule already allows the screen"
+    code, msg = pkexec_ufw(ufw_rule(host))
+    if code != 0:
+        return False, msg or f"ufw exited with {code}"
+    write_firewall({"host": host, "openedAt": time.time()})
+    if not rule_for_host(read_rules(), host):
+        return False, "ufw reported success but the rule isn't in /etc/ufw/user.rules"
+    return True, "opened"
+
+
+def firewall_close():
+    """Remove the per-cast rule Beam recorded, if it is still there."""
+    import fcntl
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(os.path.join(STATE_DIR, "firewall.lock"), "w") as lock:
+        # The watcher and a click on Close firewall can both get here; the
+        # lock makes the second one find nothing left to do, so there is never
+        # a second password prompt for the same rule.
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = read_firewall()
+        host = state.get("host", "")
+        if not host:
+            return True, "nothing to close"
+        if not rule_for_host(read_rules(), host):
+            write_firewall({})
+            return True, "rule was already gone"
+        code, msg = pkexec_ufw(["delete"] + ufw_rule(host))
+        if code != 0:
+            return False, msg or f"ufw exited with {code}"
+        if rule_for_host(read_rules(), host):
+            return False, "ufw reported success but the rule is still there"
+        write_firewall({})
+        return True, "closed"
+
+
+def cmd_firewall_close():
+    ok, msg = firewall_close()
+    emit({"ok": ok, "message": msg} if ok else {"ok": False, "error": "Firewall rule not removed: " + msg},
+         0 if ok else 1)
+
+
+def firewall_status(casting):
+    """What the panel shows about the per-cast rule."""
+    state = read_firewall()
+    host = state.get("host", "")
+    if not host:
+        return {}
+    alive = bool(state.get("watcher")) and "_watch" in " ".join(proc_cmdline(state["watcher"]))
+    present = rule_for_host(read_rules(), host)
+    if not present:
+        if not casting and not alive:
+            write_firewall({})
+        return {}
+    return {"host": host, "stale": not casting and not alive}
+
+
+def cmd_watch(pid):
+    """Outlive the cast: when doubletake exits, however it ends, put the sound
+    output back and remove the firewall rule."""
+    state = read_firewall()
+    if state:
+        state["watcher"] = os.getpid()
+        write_firewall(state)
+    while is_doubletake(pid):
+        time.sleep(1)
+    restore_sink(read_session().get("prevSink", ""))
+    firewall_close()
+
+
 # ------------------------------------------------------------------- session
 
 def read_session():
@@ -560,7 +710,8 @@ def cmd_status():
         emit({"ok": True, "state": state, "external": False, "pid": pid,
               "name": sess.get("name", ""), "host": sess.get("host", ""), "port": sess.get("port"),
               "audio": sess.get("audio", False), "needsCode": info["needsCode"],
-              "lastError": info["lastError"], "log": "\n".join(log.splitlines()[-30:])})
+              "lastError": info["lastError"], "log": "\n".join(log.splitlines()[-30:]),
+              "firewall": firewall_status(True)})
 
     failed = bool(sess and log and not info["ended"] and (info["lastError"] or info["needsCode"]))
     recent = time.time() - float(sess.get("startedAt", 0) or 0) < 120
@@ -573,14 +724,15 @@ def cmd_status():
         args = proc_cmdline(others[0])
         emit({"ok": True, "state": "live", "external": True, "pid": others[0], "name": "",
               "host": arg_value(args, "-target"), "port": int(arg_value(args, "-port") or 7000),
-              "audio": "-no-audio" not in args, "needsCode": False, "lastError": "", "log": ""})
+              "audio": "-no-audio" not in args, "needsCode": False, "lastError": "", "log": "",
+              "firewall": firewall_status(False)})
 
     state = "failed" if failed else "idle"
     emit({"ok": True, "state": state, "external": False, "pid": None,
           "name": sess.get("name", ""), "host": sess.get("host", ""), "port": sess.get("port"),
           "audio": False, "needsCode": info["needsCode"] if state == "failed" else False,
           "lastError": info["lastError"] if state == "failed" else "",
-          "log": "\n".join(log.splitlines()[-30:])})
+          "log": "\n".join(log.splitlines()[-30:]), "firewall": firewall_status(False)})
 
 
 def cmd_start(argv):
@@ -613,6 +765,19 @@ def cmd_start(argv):
     if sess.get("pid") and is_doubletake(sess["pid"]):
         emit({"ok": False, "error": "already casting", "pid": sess["pid"]}, 1)
 
+    # The firewall rule names the screen's address, so a hostname is resolved
+    # to the IPv4 address doubletake will reach.
+    try:
+        fw_host = str(ipaddress.ip_address(a.host))
+    except ValueError:
+        try:
+            fw_host = socket.gethostbyname(a.host)
+        except OSError:
+            emit({"ok": False, "error": f"can't resolve {a.host}"}, 1)
+    ok, msg = firewall_open(fw_host)
+    if not ok:
+        emit({"ok": False, "error": "The firewall wasn't opened for the screen, so the cast didn't start: " + msg}, 1)
+
     args = [dt, "-target", a.host, "-port", str(a.port), "-port-range", PORT_RANGE]
     if a.device_id:
         args += ["-device-id", a.device_id.upper()]
@@ -641,11 +806,13 @@ def cmd_start(argv):
                    "deviceId": a.device_id, "audio": a.audio, "prevSink": prev_sink,
                    "startedAt": time.time()})
 
+    helper = [sys.executable, os.path.realpath(__file__)]
+    quiet = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                 start_new_session=True)
     if a.audio:
-        subprocess.Popen([sys.executable, os.path.realpath(__file__), "_route-audio", str(p.pid)],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
-    emit({"ok": True, "pid": p.pid, "args": args[1:]})
+        subprocess.Popen(helper + ["_route-audio", str(p.pid)], **quiet)
+    subprocess.Popen(helper + ["_watch", str(p.pid)], **quiet)
+    emit({"ok": True, "pid": p.pid, "args": args[1:], "firewall": msg})
 
 
 def cmd_route_audio(pid):
@@ -718,6 +885,10 @@ def main():
         cmd_stop()
     elif cmd == "status":
         cmd_status()
+    elif cmd == "firewall-close":
+        cmd_firewall_close()
+    elif cmd == "_watch" and rest:
+        cmd_watch(int(rest[0]))
     elif cmd == "_route-audio" and rest:
         cmd_route_audio(int(rest[0]))
     else:

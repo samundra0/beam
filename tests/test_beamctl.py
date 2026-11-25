@@ -121,6 +121,100 @@ class Firewall(unittest.TestCase):
         self.assertFalse(beamctl.ufw_allows(rules, "192.168.1.5"))
 
 
+class PerCastFirewall(unittest.TestCase):
+    """Open for one screen on cast, closed afterwards, with ufw faked by a rules file."""
+
+    HOST = "192.168.1.50"
+    TUPLE = "### tuple ### allow udp 60000:60010 0.0.0.0/0 any {src} in\n"
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.TemporaryDirectory()
+        d = self.dir.name
+        self.saved = {k: getattr(beamctl, k) for k in
+                      ("STATE_DIR", "FIREWALL_PATH", "UFW_RULES", "ufw_enabled", "pkexec_ufw")}
+        beamctl.STATE_DIR = d
+        beamctl.FIREWALL_PATH = os.path.join(d, "firewall.json")
+        beamctl.UFW_RULES = os.path.join(d, "user.rules")
+        beamctl.ufw_enabled = lambda: True
+        self.calls = []
+        self.write_rules("")
+
+        def fake_pkexec(args):
+            self.calls.append(args)
+            if self.refuse:
+                return 126, "password dialog dismissed"
+            line = self.TUPLE.format(src=args[args.index("from") + 1])
+            rules = self.read_rules()
+            self.write_rules(rules.replace(line, "") if args[0] == "delete" else rules + line)
+            return 0, ""
+        self.refuse = False
+        beamctl.pkexec_ufw = fake_pkexec
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            setattr(beamctl, k, v)
+        self.dir.cleanup()
+
+    def write_rules(self, text):
+        with open(beamctl.UFW_RULES, "w") as f:
+            f.write(text)
+
+    def read_rules(self):
+        with open(beamctl.UFW_RULES) as f:
+            return f.read()
+
+    def test_open_then_close_adds_and_removes_one_host_rule(self):
+        ok, _ = beamctl.firewall_open(self.HOST)
+        self.assertTrue(ok)
+        self.assertTrue(beamctl.rule_for_host(self.read_rules(), self.HOST))
+        self.assertEqual(self.calls[0], ["allow", "from", self.HOST, "to", "any", "port", "60000:60010",
+                                         "proto", "udp"])
+        ok, msg = beamctl.firewall_close()
+        self.assertTrue(ok, msg)
+        self.assertFalse(beamctl.rule_for_host(self.read_rules(), self.HOST))
+        self.assertEqual(self.calls[1][0], "delete")
+        self.assertEqual(beamctl.read_firewall(), {})
+
+    def test_second_close_does_not_prompt_again(self):
+        beamctl.firewall_open(self.HOST)
+        beamctl.firewall_close()
+        beamctl.firewall_close()
+        self.assertEqual(len(self.calls), 2)
+
+    def test_dismissed_password_means_no_cast(self):
+        self.refuse = True
+        ok, msg = beamctl.firewall_open(self.HOST)
+        self.assertFalse(ok)
+        self.assertIn("dismissed", msg)
+        self.assertEqual(beamctl.read_firewall(), {})
+
+    def test_existing_subnet_rule_is_used_and_never_removed(self):
+        self.write_rules(self.TUPLE.format(src="192.168.1.0/24"))
+        ok, _ = beamctl.firewall_open(self.HOST)
+        self.assertTrue(ok)
+        self.assertEqual(self.calls, [])
+        beamctl.firewall_close()
+        self.assertEqual(self.calls, [])
+        self.assertIn("192.168.1.0/24", self.read_rules())
+
+    def test_ufw_off_needs_nothing(self):
+        beamctl.ufw_enabled = lambda: False
+        self.assertTrue(beamctl.firewall_open(self.HOST)[0])
+        self.assertEqual(self.calls, [])
+
+    def test_rule_left_behind_is_reported_stale(self):
+        beamctl.firewall_open(self.HOST)
+        self.assertEqual(beamctl.firewall_status(False), {"host": self.HOST, "stale": True})
+        self.assertEqual(beamctl.firewall_status(True), {"host": self.HOST, "stale": False})
+
+    def test_rule_removed_by_hand_clears_state(self):
+        beamctl.firewall_open(self.HOST)
+        self.write_rules("")
+        self.assertEqual(beamctl.firewall_status(False), {})
+        self.assertEqual(beamctl.read_firewall(), {})
+
+
 class LogState(unittest.TestCase):
     LIVE = """2026/11/25 12:35:09 connected to: Apple TV (model: AppleTV3,2, initialVolume: unavailable, volumeControlType: 0)
 2026/11/25 12:35:09 pairing complete

@@ -9,7 +9,7 @@
   "state.liveExternal": "Casting to %1 · external",
   "state.failed": "Cast failed",
   "network.wifi": "Wi-Fi: %1 · %2",
-  "network.none": "Not on Wi-Fi. Join the screen's hotspot or network.",
+  "network.none": "Not connected. Join the screen's hotspot or network.",
   "setup.header": "Setup",
   "setup.fix": "Fix in terminal",
   "setup.install": "Install doubletake",
@@ -29,5 +29,11 @@
   "options.sound": "Send sound to the screen",
   "options.cursor": "Show the mouse cursor",
   "log.show": "Show log",
-  "log.hide": "Hide log"
+  "log.hide": "Hide log",
+  "state.starting": "Starting… enter your password if asked, to open the firewall for the screen",
+  "state.closingFirewall": "Closing the firewall… enter your password if asked",
+  "network.wired": "Network: %1 · %2",
+  "firewall.open": "Firewall open for %1 while casting; it closes when the cast ends",
+  "firewall.stale": "The firewall is still open for %1 from an earlier cast.",
+  "firewall.close": "Close firewall"
 }

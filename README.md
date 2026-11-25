@@ -38,12 +38,29 @@ Prefer the terminal? This does both in one go:
 |---|---|
 | GStreamer and audio packages | `sudo pacman -S --needed gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav gst-plugin-pipewire gst-plugin-va libpulse avahi` (only the missing ones) |
 | Screen discovery | `sudo systemctl enable --now avahi-daemon` |
-| Firewall (only if ufw is on) | `sudo ufw allow from 10.0.0.0/8 to any port 60000:60010 proto udp`, and the same for `172.16.0.0/12` and `192.168.0.0/16` |
 
-The firewall rule opens UDP 60000–60010 to private networks only. The screen
-sends its timing and audio traffic back to the laptop on those ports, and Beam
-always starts doubletake with `-port-range 60000-60010`. Optional:
-`libfdk-aac` gives AAC sound; without it doubletake falls back to ALAC.
+Optional: `libfdk-aac` gives AAC sound; without it doubletake falls back to
+ALAC.
+
+### The firewall: open only while casting
+
+The screen sends its timing and audio traffic back to the laptop, on UDP ports
+60000–60010 (Beam always starts doubletake with `-port-range 60000-60010`).
+With ufw on, those packets are blocked, so Beam opens the ports **for the one
+screen you cast to, only while you cast**:
+
+1. You press **Cast**. Omarchy's password dialog asks to run
+   `ufw allow from <screen-ip> to any port 60000:60010 proto udp`.
+   Dismiss it and the cast doesn't start.
+2. When the cast ends — **Stop**, the screen disconnecting, or doubletake
+   exiting for any reason — a small watcher asks for your password again and
+   runs `ufw delete allow from <screen-ip> …` to remove that rule.
+3. If the rule is ever left behind (say you logged out mid-cast), the panel
+   says so and offers **Close firewall**; `beamctl firewall-close` does the same.
+
+Beam only removes the rule it added. If you already have a rule that lets the
+screen in (for example a permanent one for your network), Beam uses it, doesn't
+prompt, and never removes it. With ufw off, nothing is changed.
 
 ## Use
 
@@ -83,7 +100,7 @@ AirPlay only).
 |---|---|
 | No screens listed | Not on the screen's network, or avahi isn't running. Run `beamctl doctor`. Guest/corporate Wi-Fi often blocks device discovery (client isolation): use the screen's hotspot instead |
 | Screen listed but "not answering" | It's asleep or on another input, or a VPN is routing traffic away. Try again with the screen's casting/AirPlay page open |
-| Connects, then drops or no picture | Firewall: check the Setup section, or `sudo ufw status` for the 60000:60010 rule |
+| Connects, then drops or no picture | Firewall: the per-cast rule wasn't added (password dialog dismissed?). `sudo ufw status` shows the 60000:60010 rule while casting |
 | Black picture | Pick a display (not a window) in the screen-share picker; check `xdg-desktop-portal-hyprland` is running |
 | Asks for a code every time | Remove the old pairing: delete the screen's entry in `~/.config/doubletake/credentials.json` |
 | No sound on the screen | Turn on *Send sound to the screen*, or pick **doubletake** as the output in your sound settings |
@@ -102,6 +119,7 @@ beamctl setup               # install doubletake and run those fixes (human-read
 beamctl start HOST PORT [--device-id ID] [--name NAME] [--audio] [--no-cursor] [--code PIN]
 beamctl status              # idle / connecting / pairing / live / failed
 beamctl stop
+beamctl firewall-close      # remove a per-cast firewall rule left behind
 ```
 
 The cast runs detached and survives shell reloads. A doubletake started outside
@@ -115,8 +133,8 @@ omarchy plugin remove beam.cast
 rm -rf ~/.local/lib/beam ~/.local/state/beam      # doubletake and Beam's state
 ```
 
-Removing doesn't undo the firewall rule or the installed packages; delete the
-rule with `sudo ufw status numbered` and `sudo ufw delete <n>` if you want.
+Removing doesn't uninstall the packages setup added. Run `beamctl firewall-close`
+first if the panel shows a firewall rule left open.
 
 ## Development
 

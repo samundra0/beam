@@ -25,6 +25,7 @@ Panel {
   property bool discovering: false
   property bool installing: false
   property string actionError: ""
+  property string pendingAction: ""
   property var status: ({ state: "idle" })
   property bool showLog: false
   property int deviceIndex: 0
@@ -40,6 +41,7 @@ Panel {
       if (devices[i].host === host) return String(devices[i].name)
     return String(status.name || "") || host
   }
+  readonly property var firewall: status.firewall || ({})
   readonly property bool doubletakeMissing: {
     for (var i = 0; i < checks.length; i++)
       if (checks[i].id === "doubletake" && !checks[i].ok) return true
@@ -49,6 +51,8 @@ Panel {
   Commons.Translations { id: strings; directory: Qt.resolvedUrl("i18n") }
 
   function stateText() {
+    if (pendingAction === "start") return strings.t("state.starting")
+    if (pendingAction === "firewall-close") return strings.t("state.closingFirewall")
     if (castState === "live")
       return status.external ? strings.t("state.liveExternal").arg(targetLabel) : strings.t("state.live").arg(targetLabel)
     if (castState === "connecting") return strings.t("state.connecting")
@@ -72,6 +76,7 @@ Panel {
   function runAction(args) {
     if (actionProc.running) return
     actionError = ""
+    pendingAction = String(args[0])
     actionProc.command = ["python3", helper].concat(args)
     actionProc.running = true
   }
@@ -173,6 +178,7 @@ Panel {
     }
     onExited: {
       root.installing = false
+      root.pendingAction = ""
       root.refreshStatus()
       root.refreshDoctor()
     }
@@ -296,7 +302,44 @@ Panel {
           font.pixelSize: Style.font.bodySmall
           text: root.network && root.network.ssid
             ? strings.t("network.wifi").arg(String(root.network.ssid)).arg(String(root.network.ip || ""))
-            : strings.t("network.none")
+            : root.network && root.network.ip
+              ? strings.t("network.wired").arg(String(root.network.iface || "")).arg(String(root.network.ip))
+              : strings.t("network.none")
+        }
+
+        // ---------- Firewall ----------
+        // While casting, the screen's address is let through UDP 60000-60010;
+        // the rule goes when the cast ends. One left behind (a logout mid-cast)
+        // is shown here so it can be closed.
+        Label {
+          visible: root.firewall.host !== undefined && !root.firewall.stale
+          width: parent.width
+          opacity: 0.6
+          wrapMode: Text.Wrap
+          elide: Text.ElideNone
+          font.pixelSize: Style.font.caption
+          text: strings.t("firewall.open").arg(String(root.firewall.host || ""))
+        }
+        Column {
+          visible: root.firewall.stale === true
+          width: parent.width
+          spacing: Style.space(6)
+          Label {
+            width: parent.width
+            wrapMode: Text.Wrap
+            elide: Text.ElideNone
+            color: Commons.Color.urgent
+            font.pixelSize: Style.font.bodySmall
+            text: strings.t("firewall.stale").arg(String(root.firewall.host || ""))
+          }
+          Button {
+            text: strings.t("firewall.close")
+            enabled: !actionProc.running
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+            bordered: true
+            onClicked: root.runAction(["firewall-close"])
+          }
         }
 
         // ---------- Errors and pairing ----------
