@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "beam.cast",
   "name": "Beam",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Samundra Raj Bajracharya",
   "license": "MIT",
   "description": "Mirror your screen to any AirPlay screen (Apple TV, AirPlay TVs, meeting-room panels) from the Omarchy bar, using doubletake.",
