@@ -19,12 +19,21 @@ mkdir -p "$DEST"
 for f in beamctl Panel.qml manifest.json LICENSE README.md; do
   cp "$ROOT/$f" "$DEST/$f"
 done
-rm -rf "$DEST/i18n"
-cp -r "$ROOT/i18n" "$DEST/i18n"
+for d in i18n system; do
+  rm -rf "$DEST/$d"
+  cp -r "$ROOT/$d" "$DEST/$d"
+done
 chmod +x "$DEST/beamctl"
 
 omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
 if ! omarchy plugin list --json | jq -e '.[] | select(.id == "beam.cast" and .enabled == true)' >/dev/null 2>&1; then
   omarchy plugin enable beam.cast right || true
+fi
+
+# The shell caches a plugin's QML in memory: its hot reload and even
+# disable/enable keep running the old Panel.qml. Only a shell restart loads
+# the new one. --no-restart skips it (beamctl changes need no restart).
+if [ "${1:-}" != "--no-restart" ]; then
+  omarchy restart shell >/dev/null 2>&1 || echo "Restart the shell to load the new panel: omarchy restart shell"
 fi
 echo "Installed Beam to $DEST"

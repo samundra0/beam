@@ -1,0 +1,24 @@
+#!/bin/bash
+# Beam's privileged helper, run through pkexec so polkit can show a readable
+# message ("open" action in io.github.samundra0.beam.policy) instead of a
+# raw ufw command line. It does exactly one thing: let one screen's IPv4 address reach UDP 60000-60010.
+# Installed root-owned in /usr/local/libexec/beam by `beamctl setup`.
+set -euo pipefail
+export PATH=/usr/bin:/bin
+
+ip=${1:-}
+if [[ $# -ne 1 || ! $ip =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+  echo "usage: $0 <screen IPv4 address>" >&2
+  exit 2
+fi
+for octet in "${BASH_REMATCH[@]:1}"; do
+  (( 10#$octet <= 255 )) || { echo "invalid address: $ip" >&2; exit 2; }
+done
+first=$((10#${BASH_REMATCH[1]}))
+# Never a wildcard, loopback, multicast or broadcast address.
+if (( first == 0 || first == 127 || first >= 224 )); then
+  echo "refusing address: $ip" >&2
+  exit 2
+fi
+
+exec /usr/bin/ufw allow from "$ip" to any port 60000:60010 proto udp

@@ -35,6 +35,7 @@ Panel {
   readonly property bool casting: castState === "live" || castState === "connecting" || castState === "pairing"
   readonly property bool sound: setting("sound", true) === true
   readonly property bool showCursor: setting("cursor", true) === true
+  readonly property bool askSource: setting("askSource", true) === true
   readonly property string targetLabel: {
     var host = String(status.host || "")
     for (var i = 0; i < devices.length; i++)
@@ -53,6 +54,7 @@ Panel {
   function stateText() {
     if (pendingAction === "start") return strings.t("state.starting")
     if (pendingAction === "firewall-close") return strings.t("state.closingFirewall")
+    if (pendingAction === "change-source") return strings.t("state.changingSource")
     if (castState === "live")
       return status.external ? strings.t("state.liveExternal").arg(targetLabel) : strings.t("state.live").arg(targetLabel)
     if (castState === "connecting") return strings.t("state.connecting")
@@ -81,12 +83,15 @@ Panel {
     actionProc.running = true
   }
 
-  function cast(device, code) {
+  // choose forces Hyprland's screen-share picker even when "Ask what to share
+  // each time" is off.
+  function cast(device, code, choose) {
     if (!device || !device.host) return
     var args = ["start", String(device.host), String(device.port), "--name", String(device.name || "")]
     if (device.deviceId) args.push("--device-id", String(device.deviceId))
     if (sound) args.push("--audio")
     if (!showCursor) args.push("--no-cursor")
+    if (askSource || choose) args.push("--choose")
     if (code) args.push("--code", code)
     runAction(args)
   }
@@ -497,7 +502,7 @@ Panel {
               id: rowContent
               anchors.left: parent.left
               anchors.leftMargin: Style.space(8)
-              anchors.right: castButton.left
+              anchors.right: chooseButton.left
               anchors.rightMargin: Style.space(8)
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(2)
@@ -515,6 +520,21 @@ Panel {
                 font.pixelSize: Style.font.caption
                 width: parent.width
               }
+            }
+
+            Button {
+              id: chooseButton
+              anchors.right: castButton.left
+              anchors.rightMargin: Style.space(6)
+              anchors.verticalCenter: parent.verticalCenter
+              text: strings.t("screens.choose")
+              // Idle: cast with the picker. Casting here: restart this cast with
+              // the picker to share something else.
+              enabled: !actionProc.running && (row.current || (!root.casting && row.modelData.reachable))
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              bordered: true
+              onClicked: row.current ? root.runAction(["change-source"]) : root.cast(row.modelData, "", true)
             }
 
             Button {
@@ -547,6 +567,11 @@ Panel {
           label: strings.t("options.cursor")
           checked: root.showCursor
           onToggled: root.setOption("cursor", !root.showCursor)
+        }
+        OptionRow {
+          label: strings.t("options.askSource")
+          checked: root.askSource
+          onToggled: root.setOption("askSource", !root.askSource)
         }
 
         // ---------- Log ----------

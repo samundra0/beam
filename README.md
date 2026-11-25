@@ -38,6 +38,7 @@ Prefer the terminal? This does both in one go:
 |---|---|
 | GStreamer and audio packages | `sudo pacman -S --needed gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav gst-plugin-pipewire gst-plugin-va libpulse avahi` (only the missing ones) |
 | Screen discovery | `sudo systemctl enable --now avahi-daemon` |
+| Readable firewall prompts (only if ufw is on) | `sudo install -D -o root -g root …` the two helpers in `system/` to `/usr/local/libexec/beam/` and `system/io.github.samundra0.beam.policy` to `/usr/share/polkit-1/actions/` |
 
 Optional: `libfdk-aac` gives AAC sound; without it doubletake falls back to
 ALAC.
@@ -49,14 +50,24 @@ The screen sends its timing and audio traffic back to the laptop, on UDP ports
 With ufw on, those packets are blocked, so Beam opens the ports **for the one
 screen you cast to, only while you cast**:
 
-1. You press **Cast**. Omarchy's password dialog asks to run
-   `ufw allow from <screen-ip> to any port 60000:60010 proto udp`.
+1. You press **Cast**. Omarchy's password dialog says *"Beam wants to let the
+   screen you're casting to send sound and timing back to this computer…"*,
+   and Beam then runs `ufw allow from <screen-ip> to any port 60000:60010 proto udp`.
    Dismiss it and the cast doesn't start.
 2. When the cast ends — **Stop**, the screen disconnecting, or doubletake
-   exiting for any reason — a small watcher asks for your password again and
-   runs `ufw delete allow from <screen-ip> …` to remove that rule.
+   exiting for any reason — a small watcher asks again (*"Casting has stopped.
+   Beam wants to close the firewall opening it made…"*) and runs
+   `ufw delete allow from <screen-ip> …` to remove that rule.
 3. If the rule is ever left behind (say you logged out mid-cast), the panel
    says so and offers **Close firewall**; `beamctl firewall-close` does the same.
+
+The readable wording comes from two root-owned helpers that setup installs,
+`beam-firewall-open` and `beam-firewall-close` in `/usr/local/libexec/beam/`,
+with their polkit actions in
+`/usr/share/polkit-1/actions/io.github.samundra0.beam.policy`. Each takes only
+a screen's IPv4 address (refusing wildcard, loopback, multicast and broadcast
+addresses) and adds or removes exactly that one rule. Without them Beam still
+works, but the dialog shows the raw `ufw` command instead.
 
 Beam only removes the rule it added. If you already have a rule that lets the
 screen in (for example a permanent one for your network), Beam uses it, doesn't
@@ -67,7 +78,9 @@ prompt, and never removes it. With ufw off, nothing is changed.
 1. Be on the same network as the screen: the same Wi-Fi, or the screen's own
    hotspot (many meeting-room panels have one).
 2. Click the cast icon in the bar. Screens appear under **Screens**.
-3. Press **Cast**. If Hyprland's screen-share picker appears, pick your display.
+3. Press **Cast**. Hyprland's screen-share picker appears: share a whole
+   display, one window, or a region. **Choose…** always brings the picker
+   back; with *Ask what to share each time* off, **Cast** reuses your last pick.
 4. If the screen shows a code, type it into the field Beam shows. The pairing
    is remembered.
 5. **Stop** in the panel, or right-click the bar icon, ends the cast.
@@ -76,6 +89,7 @@ prompt, and never removes it. With ufw off, nothing is changed.
 |---|---|
 | Send sound to the screen | Makes doubletake's sound output the default while casting, and restores the previous one when you stop |
 | Show the mouse cursor | Turn off to hide the pointer on the screen |
+| Ask what to share each time | Show the screen-share picker on every Cast. Off: reuse the last pick (doubletake's saved portal choice) |
 
 Keyboard: arrow keys move between screens, Enter casts or stops, Esc closes.
 
@@ -101,7 +115,7 @@ AirPlay only).
 | No screens listed | Not on the screen's network, or avahi isn't running. Run `beamctl doctor`. Guest/corporate Wi-Fi often blocks device discovery (client isolation): use the screen's hotspot instead |
 | Screen listed but "not answering" | It's asleep or on another input, or a VPN is routing traffic away. Try again with the screen's casting/AirPlay page open |
 | Connects, then drops or no picture | Firewall: the per-cast rule wasn't added (password dialog dismissed?). `sudo ufw status` shows the 60000:60010 rule while casting |
-| Black picture | Pick a display (not a window) in the screen-share picker; check `xdg-desktop-portal-hyprland` is running |
+| Black picture | Check `xdg-desktop-portal-hyprland` is running; if a shared window goes black when minimised or on another workspace, share the display instead |
 | Asks for a code every time | Remove the old pairing: delete the screen's entry in `~/.config/doubletake/credentials.json` |
 | No sound on the screen | Turn on *Send sound to the screen*, or pick **doubletake** as the output in your sound settings |
 
@@ -134,17 +148,26 @@ rm -rf ~/.local/lib/beam ~/.local/state/beam      # doubletake and Beam's state
 ```
 
 Removing doesn't uninstall the packages setup added. Run `beamctl firewall-close`
-first if the panel shows a firewall rule left open.
+first if the panel shows a firewall rule left open, then remove the helpers:
+
+```sh
+sudo rm -r /usr/local/libexec/beam /usr/share/polkit-1/actions/io.github.samundra0.beam.policy
+```
 
 ## Development
 
 ```sh
 bin/test       # unit tests for discovery, the screen filter, firewall rules and log parsing
-bin/install    # copy this checkout into ~/.config/omarchy/plugins/beam.cast (hot-reloads)
+bin/install    # copy this checkout into ~/.config/omarchy/plugins/beam.cast and restart the shell
 ```
 
+The shell caches `Panel.qml` in memory, so its hot reload (and even disabling
+and re-enabling the plugin) keeps showing the old panel; `bin/install` restarts
+the shell to load the new one. Pass `--no-restart` when only `beamctl` changed.
+
 Layout: `manifest.json` and `Panel.qml` are the plugin, `beamctl` is the
-Python helper (standard library only), `i18n/` holds the strings.
+Python helper (standard library only), `i18n/` holds the strings, and
+`system/` holds the root-owned firewall helpers and their polkit policy.
 
 ## Credits
 

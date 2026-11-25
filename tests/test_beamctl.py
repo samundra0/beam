@@ -2,6 +2,7 @@
 
 import importlib.machinery
 import importlib.util
+import json
 import os
 import unittest
 
@@ -213,6 +214,114 @@ class PerCastFirewall(unittest.TestCase):
         self.write_rules("")
         self.assertEqual(beamctl.firewall_status(False), {})
         self.assertEqual(beamctl.read_firewall(), {})
+
+
+class PkexecCommand(unittest.TestCase):
+    """Which program pkexec is asked to run decides the dialog's wording."""
+
+    def run_with(self, installed, args):
+        saved = (beamctl.helpers_installed, beamctl.subprocess.run, beamctl.shutil.which, beamctl.ufw_path)
+        seen = {}
+
+        class Done:
+            returncode, stdout, stderr = 0, "", ""
+
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+            return Done()
+        beamctl.helpers_installed = lambda: installed
+        beamctl.subprocess.run = fake_run
+        beamctl.shutil.which = lambda name: "/usr/bin/" + name
+        beamctl.ufw_path = lambda: "/usr/bin/ufw"
+        try:
+            beamctl.pkexec_ufw(args)
+        finally:
+            (beamctl.helpers_installed, beamctl.subprocess.run, beamctl.shutil.which, beamctl.ufw_path) = saved
+        return seen["cmd"]
+
+    def test_helpers_get_just_the_address(self):
+        rule = beamctl.ufw_rule("192.168.1.50")
+        self.assertEqual(self.run_with(True, rule),
+                         ["/usr/bin/pkexec", "/usr/local/libexec/beam/beam-firewall-open", "192.168.1.50"])
+        self.assertEqual(self.run_with(True, ["delete"] + rule),
+                         ["/usr/bin/pkexec", "/usr/local/libexec/beam/beam-firewall-close", "192.168.1.50"])
+
+    def test_without_helpers_falls_back_to_ufw(self):
+        rule = beamctl.ufw_rule("192.168.1.50")
+        self.assertEqual(self.run_with(False, rule), ["/usr/bin/pkexec", "/usr/bin/ufw"] + rule)
+
+    def test_helper_files_ship_with_the_plugin(self):
+        for src, dest, mode in beamctl.system_files():
+            self.assertTrue(os.path.isfile(src), src)
+        self.assertEqual(len(beamctl.helper_install_commands()), 3)
+
+
+class ShareChoice(unittest.TestCase):
+    """--choose drops only doubletake's saved screen pick, never the pairing."""
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.dir.name, "credentials.json")
+        self.creds = {
+            "E4:65:64:61:E4:69": {"pairing_id": "p1", "ed25519_seed": "s1", "restore_token": "t1"},
+            "AA:BB:CC:DD:EE:FF": {"pairing_id": "p2", "restore_token": "t2"},
+        }
+        with open(self.path, "w") as f:
+            json.dump(self.creds, f)
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def load(self):
+        with open(self.path) as f:
+            return json.load(f)
+
+    def test_drops_only_that_screens_token(self):
+        self.assertEqual(beamctl.forget_share_choice("e4:65:64:61:e4:69", self.path), 1)
+        d = self.load()
+        self.assertNotIn("restore_token", d["E4:65:64:61:E4:69"])
+        self.assertEqual(d["E4:65:64:61:E4:69"]["ed25519_seed"], "s1")
+        self.assertEqual(d["AA:BB:CC:DD:EE:FF"]["restore_token"], "t2")
+
+    def test_without_device_id_drops_every_token(self):
+        self.assertEqual(beamctl.forget_share_choice("", self.path), 2)
+        self.assertTrue(all("restore_token" not in c for c in self.load().values()))
+
+    def test_keeps_file_private(self):
+        beamctl.forget_share_choice("", self.path)
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+
+    def test_missing_file_is_fine(self):
+        self.assertEqual(beamctl.forget_share_choice("", self.path + ".nope"), 0)
+
+
+class SourceHandover(unittest.TestCase):
+    """The old cast's watcher must leave the firewall and sound to the new cast."""
+
+    def setUp(self):
+        self.saved = beamctl.is_doubletake
+
+    def tearDown(self):
+        beamctl.is_doubletake = self.saved
+
+    def test_marked_before_restart(self):
+        beamctl.is_doubletake = lambda pid: False
+        self.assertTrue(beamctl.handed_over(100, {"pid": 100, "handoverFrom": 100}))
+
+    def test_new_cast_running(self):
+        beamctl.is_doubletake = lambda pid: pid == 200
+        self.assertTrue(beamctl.handed_over(100, {"pid": 200, "handoverFrom": 100}))
+        self.assertTrue(beamctl.handed_over(100, {"pid": 200}))
+
+    def test_plain_stop_is_not_a_handover(self):
+        beamctl.is_doubletake = lambda pid: False
+        self.assertFalse(beamctl.handed_over(100, {"pid": None}))
+        self.assertFalse(beamctl.handed_over(100, {"pid": 100}))
+
+    def test_failed_replacement_is_not_a_handover_for_its_own_watcher(self):
+        beamctl.is_doubletake = lambda pid: False
+        self.assertFalse(beamctl.handed_over(200, {"pid": 200, "handoverFrom": 100}))
 
 
 class LogState(unittest.TestCase):

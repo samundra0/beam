@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Beam: readable password prompts for its two firewall helpers. -->
+<policyconfig>
+  <vendor>Beam</vendor>
+  <vendor_url>https://github.com/samundra0/beam</vendor_url>
+
+  <action id="io.github.samundra0.beam.firewall-open">
+    <description>Open the firewall for screen casting</description>
+    <message>Beam wants to let the screen you're casting to send sound and timing back to this computer. Only that screen is allowed in, and only until casting stops.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/beam/beam-firewall-open</annotate>
+  </action>
+
+  <action id="io.github.samundra0.beam.firewall-close">
+    <description>Close the firewall after screen casting</description>
+    <message>Casting has stopped. Beam wants to close the firewall opening it made for the screen.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/beam/beam-firewall-close</annotate>
+  </action>
+</policyconfig>

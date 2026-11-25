@@ -20,11 +20,28 @@
     "defaultSection": "right",
     "defaults": {
       "sound": true,
-      "cursor": true
+      "cursor": true,
+      "askSource": true
     },
     "schema": [
-      { "key": "sound", "type": "boolean", "label": "Send sound to the screen", "defaultValue": true },
-      { "key": "cursor", "type": "boolean", "label": "Show the mouse cursor", "defaultValue": true }
+      {
+        "key": "sound",
+        "type": "boolean",
+        "label": "Send sound to the screen",
+        "defaultValue": true
+      },
+      {
+        "key": "cursor",
+        "type": "boolean",
+        "label": "Show the mouse cursor",
+        "defaultValue": true
+      },
+      {
+        "key": "askSource",
+        "type": "boolean",
+        "label": "Ask what to share each time",
+        "defaultValue": true
+      }
     ]
   }
 }

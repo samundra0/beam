@@ -35,5 +35,8 @@
   "network.wired": "Network: %1 · %2",
   "firewall.open": "Firewall open for %1 while casting; it closes when the cast ends",
   "firewall.stale": "The firewall is still open for %1 from an earlier cast.",
-  "firewall.close": "Close firewall"
+  "firewall.close": "Close firewall",
+  "options.askSource": "Ask what to share each time",
+  "screens.choose": "Source…",
+  "state.changingSource": "Reconnecting… pick what to share"
 }
