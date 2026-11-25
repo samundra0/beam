@@ -368,6 +368,43 @@ class UninstallPlan(unittest.TestCase):
         self.assertIn(beamctl.POLICY_PATH, cmd)
 
 
+class FirstRun(unittest.TestCase):
+    """Setup opens by itself once after install, never again."""
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.TemporaryDirectory()
+        self.saved = (beamctl.DATA_DIR, beamctl.FIRST_RUN_MARK, beamctl.doctor, beamctl.open_terminal)
+        beamctl.DATA_DIR = self.dir.name
+        beamctl.FIRST_RUN_MARK = os.path.join(self.dir.name, "setup-offered")
+        self.opened = []
+        beamctl.open_terminal = lambda cmd: self.opened.append(cmd)
+        self.ok = False
+        beamctl.doctor = lambda: {"ok": self.ok}
+
+    def tearDown(self):
+        beamctl.DATA_DIR, beamctl.FIRST_RUN_MARK, beamctl.doctor, beamctl.open_terminal = self.saved
+        self.dir.cleanup()
+
+    def run_first(self):
+        import contextlib, io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            beamctl.cmd_first_run()
+        return json.loads(out.getvalue())
+
+    def test_opens_setup_once(self):
+        self.assertTrue(self.run_first()["launched"])
+        self.assertEqual(self.opened, [["setup"]])
+        self.assertFalse(self.run_first()["launched"])
+        self.assertEqual(len(self.opened), 1)
+
+    def test_nothing_to_set_up(self):
+        self.ok = True
+        self.assertFalse(self.run_first()["launched"])
+        self.assertEqual(self.opened, [])
+
+
 class LogState(unittest.TestCase):
     LIVE = """2026/11/25 12:35:09 connected to: Apple TV (model: AppleTV3,2, initialVolume: unavailable, volumeControlType: 0)
 2026/11/25 12:35:09 pairing complete

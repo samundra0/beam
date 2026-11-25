@@ -50,6 +50,7 @@ DATA_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".loc
 # What setup changed on this machine, so uninstall undoes exactly that and no
 # more: packages it installed, whether it enabled avahi, and so on.
 SETUP_RECORD = os.path.join(DATA_DIR, "setup.json")
+FIRST_RUN_MARK = os.path.join(DATA_DIR, "setup-offered")
 DOUBLETAKE_CREDS = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")),
                                 "doubletake", "credentials.json")
 PLUGIN_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -419,6 +420,23 @@ def open_terminal(command):
         cmd = ["xdg-terminal-exec", "bash", "-c", script + "; read -rp 'Press Enter to close'"]
     subprocess.Popen(cmd, start_new_session=True, stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cmd_first_run():
+    """Open setup in a terminal the first time Beam loads incomplete.
+
+    The marker lives with the setup record, so uninstalling (which deletes
+    both) makes a reinstall offer setup again.
+    """
+    if os.path.exists(FIRST_RUN_MARK):
+        emit({"ok": True, "launched": False, "message": "already offered"})
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(FIRST_RUN_MARK, "w") as f:
+        f.write(time.strftime("%Y-%m-%dT%H:%M:%S\n"))
+    if doctor()["ok"]:
+        emit({"ok": True, "launched": False, "message": "nothing to set up"})
+    open_terminal(["setup"])
+    emit({"ok": True, "launched": True})
 
 
 def cmd_fix():
@@ -1211,6 +1229,8 @@ def main():
         cmd_doctor()
     elif cmd == "fix":
         cmd_fix()
+    elif cmd == "first-run":
+        cmd_first_run()
     elif cmd == "install-doubletake":
         cmd_install_doubletake()
     elif cmd == "setup":

@@ -24,6 +24,7 @@ Panel {
   property bool doctorOk: true
   property bool discovering: false
   property bool settingUp: false
+  property bool firstRunChecked: false
   property string actionError: ""
   property string pendingAction: ""
   property var status: ({ state: "idle" })
@@ -146,9 +147,29 @@ Panel {
         root.fixes = d.fixes || []
         root.doctorOk = d.ok === true
         root.network = d.network || {}
+        // Omarchy has no post-install hook, so the first load after install
+        // offers setup itself; beamctl remembers it did, so this happens once.
+        if (!root.doctorOk && !root.firstRunChecked) {
+          root.firstRunChecked = true
+          firstRunProc.running = true
+        }
       }
     }
   }
+
+  Process {
+    id: firstRunProc
+    command: ["python3", root.helper, "first-run"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var r = root.parse(text)
+        if (r && r.launched === true) root.settingUp = true
+      }
+    }
+  }
+
+  Component.onCompleted: refreshDoctor()
 
   Process {
     id: discoverProc

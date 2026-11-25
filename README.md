@@ -18,8 +18,10 @@ On Omarchy:
 omarchy plugin add https://github.com/samundra0/beam.git --enable
 ```
 
-Then click the cast icon in the bar. If anything is missing, the **Setup**
-section lists it with one button, **Set up Beam**, which opens a terminal that:
+Right after it's added, Beam opens a terminal running its setup (once; Omarchy
+has no install hook, so the plugin does this on its first load). If you close
+it, the cast icon's **Setup** section lists what's missing with one button,
+**Set up Beam**, which opens the same terminal. Setup:
 
 - downloads the pinned doubletake release for your machine (x86-64 or ARM64)
   into `~/.local/lib/beam/` and checks its SHA-256;
