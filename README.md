@@ -130,6 +130,7 @@ free text:
 beamctl discover [--all]    # screens, and the port that answers
 beamctl doctor              # setup checks and the commands that fix them
 beamctl setup               # install doubletake and run those fixes (human-readable)
+beamctl uninstall [--dry-run] [--all-packages]   # undo setup and remove Beam
 beamctl start HOST PORT [--device-id ID] [--name NAME] [--audio] [--no-cursor] [--code PIN]
 beamctl status              # idle / connecting / pairing / live / failed
 beamctl stop
@@ -139,20 +140,40 @@ beamctl firewall-close      # remove a per-cast firewall rule left behind
 The cast runs detached and survives shell reloads. A doubletake started outside
 Beam shows as live in the bar too, and **Stop** ends it.
 
-## Update and remove
+## Update, disable, remove
 
 ```sh
-omarchy plugin update beam.cast
-omarchy plugin remove beam.cast
-rm -rf ~/.local/lib/beam ~/.local/state/beam      # doubletake and Beam's state
+omarchy plugin update beam.cast      # pull the latest version
+omarchy plugin disable beam.cast     # hide it from the bar, keep everything installed
+omarchy plugin enable beam.cast      # bring it back
 ```
 
-Removing doesn't uninstall the packages setup added. Run `beamctl firewall-close`
-first if the panel shows a firewall rule left open, then remove the helpers:
+### Uninstall
+
+**Uninstall Beam…** at the bottom of the panel, or in a terminal:
 
 ```sh
-sudo rm -r /usr/local/libexec/beam /usr/share/polkit-1/actions/io.github.samundra0.beam.policy
+~/.config/omarchy/plugins/beam.cast/beamctl uninstall --dry-run   # show what it would do
+~/.config/omarchy/plugins/beam.cast/beamctl uninstall             # do it (asks first, then sudo)
 ```
+
+It lists every step and asks before changing anything:
+
+- stops a running cast and closes its firewall opening;
+- removes the firewall helpers and their polkit policy;
+- turns avahi off again, **only if setup turned it on**;
+- removes the packages **setup installed** (it records them in
+  `~/.local/share/beam/setup.json`), with `pacman -Rsu`, so anything another
+  package needs is kept;
+- deletes doubletake (`~/.local/lib/beam`), Beam's state and logs, the setup
+  record, and doubletake's pairings and saved picks (`~/.config/doubletake`);
+- removes the plugin from the bar.
+
+Packages that were already installed before setup ran are left alone. Add
+`--all-packages` to also be offered the casting packages
+(`gst-plugins-*`, `gst-libav`, `gst-plugin-pipewire`, `gst-plugin-va`) that no
+other installed package requires; it notes which apps use them optionally, and
+keeps `gstreamer`, `libpulse`, `avahi` and the like when other apps need them.
 
 ## Development
 

@@ -574,6 +574,17 @@ Panel {
           onToggled: root.setOption("askSource", !root.askSource)
         }
 
+        // Uninstall runs in a terminal: it asks before changing anything and
+        // needs sudo to remove what setup installed.
+        Button {
+          text: strings.t("uninstall")
+          enabled: !actionProc.running
+          foreground: root.bar.foreground
+          fontFamily: root.bar.fontFamily
+          bordered: true
+          onClicked: root.runAction(["uninstall", "--terminal"])
+        }
+
         // ---------- Log ----------
         Button {
           visible: String(root.status.log || "") !== ""

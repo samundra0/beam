@@ -12,6 +12,9 @@ Commands:
   fix                          open a terminal that runs the fix commands doctor suggests
   install-doubletake           download the pinned doubletake release into ~/.local/lib/beam
   setup                        install doubletake, then run the fix commands here (asks for sudo)
+  uninstall [--dry-run] [--yes] [--all-packages]
+                               undo everything Beam set up and remove the plugin (asks for sudo);
+                               --all-packages also offers the casting packages setup didn't install
   start HOST PORT [options]    start casting (--device-id ID --name NAME --audio --no-cursor --code PIN
                                --choose: show the screen-share picker again instead of reusing the last pick)
   stop                         stop the cast and put the previous sound output back
@@ -43,6 +46,10 @@ FIREWALL_PATH = os.path.join(STATE_DIR, "firewall.json")
 UFW_RULES = os.environ.get("BEAM_UFW_RULES", "/etc/ufw/user.rules")  # world-readable; env override for tests
 
 LIB_DIR = os.path.join(HOME, ".local/lib/beam")
+DATA_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local/share")), "beam")
+# What setup changed on this machine, so uninstall undoes exactly that and no
+# more: packages it installed, whether it enabled avahi, and so on.
+SETUP_RECORD = os.path.join(DATA_DIR, "setup.json")
 DOUBLETAKE_CREDS = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")),
                                 "doubletake", "credentials.json")
 PLUGIN_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -402,18 +409,24 @@ def cmd_doctor():
     emit(doctor())
 
 
-def cmd_fix():
-    d = doctor()
-    if not d["fixes"]:
-        emit({"ok": True, "launched": False, "message": "Nothing to fix"})
-    script = "set -e; " + "; ".join(d["fixes"]) + "; echo; echo 'Beam: setup fixed.'"
+def open_terminal(command):
+    """Run a beamctl command in a terminal, where sudo can ask for a password."""
+    script = " ".join(shlex_quote(a) for a in [sys.executable, os.path.realpath(__file__)] + command)
     launcher = shutil.which("omarchy-launch-floating-terminal-with-presentation")
     if launcher:
-        cmd = [launcher, "bash -c " + shlex_quote(script)]
+        cmd = [launcher, script]
     else:
         cmd = ["xdg-terminal-exec", "bash", "-c", script + "; read -rp 'Press Enter to close'"]
     subprocess.Popen(cmd, start_new_session=True, stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cmd_fix():
+    d = doctor()
+    if not d["fixes"]:
+        emit({"ok": True, "launched": False, "message": "Nothing to fix"})
+    # setup runs the same fixes and records them, so uninstall can undo them.
+    open_terminal(["setup"])
     emit({"ok": True, "launched": True, "commands": d["fixes"]})
 
 
@@ -464,11 +477,43 @@ def cmd_install_doubletake():
     emit({"ok": True, "path": dest, "version": DOUBLETAKE_VERSION})
 
 
+def read_record():
+    try:
+        with open(SETUP_RECORD) as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def update_record(packages=(), **flags):
+    rec = read_record()
+    rec["packages"] = sorted(set(rec.get("packages", [])) | set(packages))
+    for k, v in flags.items():
+        if v:
+            rec[k] = True
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tmp = SETUP_RECORD + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(rec, f, indent=2)
+    os.replace(tmp, SETUP_RECORD)
+
+
+def avahi_active():
+    code, out, _ = run(["systemctl", "is-active", "avahi-daemon"], timeout=3)
+    return out.strip() == "active"
+
+
 def cmd_setup():
     """Everything a new machine needs, in the terminal it was run from.
 
     Human-readable rather than JSON: this is the one command people type.
+    Everything it changes is written to SETUP_RECORD for `uninstall`.
     """
+    missing_before = missing_packages(REQUIRED_PACKAGES)
+    if not shutil.which("pkexec") and ufw_enabled():
+        missing_before.append("polkit")
+    avahi_before = avahi_active()
     if not find_doubletake():
         print(f"Downloading doubletake {DOUBLETAKE_VERSION} into {LIB_DIR} ...")
         try:
@@ -482,6 +527,14 @@ def cmd_setup():
         if subprocess.call(cmd, shell=True) != 0:
             print("Failed:", cmd)
             sys.exit(1)
+        # Record each change as soon as it has happened, so an uninstall
+        # after a half-finished setup still undoes the part that ran.
+        if cmd.startswith("sudo pacman -S"):
+            update_record(packages=[p for p in missing_before if p in cmd.split()])
+        elif "enable --now avahi-daemon" in cmd and not avahi_before:
+            update_record(avahiEnabled=True)
+        elif HELPER_DIR in cmd or POLICY_PATH in cmd:
+            update_record(helpers=True)
     d = doctor()
     for c in d["checks"]:
         mark = "ok " if c["ok"] else ("-- " if c.get("optional") else "!! ")
@@ -989,12 +1042,13 @@ def wait_exit(pid, seconds):
     return not is_doubletake(pid)
 
 
-def cmd_stop():
+def stop_cast():
+    """Stop the cast (Beam's, else any doubletake); returns the pids stopped."""
     sess = read_session()
     pids = [sess["pid"]] if sess.get("pid") and is_doubletake(sess["pid"]) else doubletake_processes()
     if not pids:
         restore_sink(sess.get("prevSink", ""))
-        emit({"ok": True, "stopped": False, "message": "Nothing is casting"})
+        return []
     for pid in pids:
         for sig, wait in ((signal.SIGINT, 5), (signal.SIGTERM, 3), (signal.SIGKILL, 2)):
             try:
@@ -1007,7 +1061,142 @@ def cmd_stop():
     if sess:
         sess["pid"] = None
         write_session(sess)
+    return pids
+
+
+def cmd_stop():
+    pids = stop_cast()
+    if not pids:
+        emit({"ok": True, "stopped": False, "message": "Nothing is casting"})
     emit({"ok": True, "stopped": True, "pids": pids})
+
+
+# ----------------------------------------------------------------- uninstall
+
+def required_by_others(pkg, removing):
+    """None if pkg isn't installed, else (packages outside the removal set
+    that require it, packages that use it optionally)."""
+    code, out, _ = run(["pacman", "-Qi", pkg], timeout=5)
+    if code != 0:
+        return None
+    found = {}
+    for key in ("Required By", "Optional For"):
+        m = re.search(rf"^{key}\s*:\s*(.*(?:\n\s{{2,}}.*)*)", out, re.M)
+        found[key] = [n for n in (m.group(1).split() if m else []) if n != "None" and n not in removing]
+    return found["Required By"], found["Optional For"]
+
+
+def uninstall_plan(record, all_packages, installed_files, required):
+    """What uninstall will do, as (description, shell command or None) steps.
+
+    record: SETUP_RECORD contents. installed_files: which system and user
+    paths exist. required(pkg, removing) -> None if not installed, else the
+    packages outside the removal set that still need it. Pure, for testing.
+    """
+    steps = []
+    if installed_files.get("helpers"):
+        steps.append(("Remove the firewall helpers and their polkit policy",
+                      f"sudo rm -f {' '.join(shlex_quote(os.path.join(HELPER_DIR, h)) for h in HELPERS.values())} "
+                      f"{shlex_quote(POLICY_PATH)} && sudo rmdir --ignore-fail-on-non-empty {shlex_quote(HELPER_DIR)}"))
+    if record.get("avahiEnabled"):
+        steps.append(("Turn avahi off again (setup turned it on)", "sudo systemctl disable --now avahi-daemon"))
+
+    candidates = list(record.get("packages", []))
+    if all_packages:
+        candidates += [p for p in REQUIRED_PACKAGES + OPTIONAL_PACKAGES if p not in candidates]
+    removing = set(candidates)
+    def short(names):
+        return ", ".join(names[:4]) + ("…" if len(names) > 4 else "")
+
+    remove, keep = [], []
+    for pkg in candidates:
+        found = required(pkg, removing)
+        if found is None:
+            continue
+        needed, optional = found
+        (keep if needed else remove).append((pkg, needed, optional))
+    if remove:
+        names = " ".join(p for p, _, _ in remove)
+        steps.append((f"Remove packages: {names}", f"sudo pacman -Rsu {names}"))
+        for pkg, _, optional in remove:
+            if optional:
+                steps.append((f"  note: {pkg} is optional for {short(optional)}", None))
+    for pkg, needed, _ in keep:
+        steps.append((f"Keep {pkg}: needed by {short(needed)}", None))
+
+    for label, path in (("doubletake", LIB_DIR), ("cast state and logs", STATE_DIR),
+                        ("setup record", DATA_DIR),
+                        ("doubletake pairings and saved picks", os.path.dirname(DOUBLETAKE_CREDS))):
+        if installed_files.get(path):
+            steps.append((f"Delete {label} ({path.replace(HOME, '~')})", None))
+    if installed_files.get("plugin"):
+        steps.append(("Remove the Beam plugin from the bar", None))
+    return steps
+
+
+def cmd_uninstall(argv):
+    """Undo setup and remove Beam. Human-readable, like setup."""
+    dry = "--dry-run" in argv
+    yes = "--yes" in argv
+    all_packages = "--all-packages" in argv
+    if "--terminal" in argv:
+        open_terminal(["uninstall"] + [a for a in argv if a in ("--all-packages",)])
+        emit({"ok": True, "launched": True})
+
+    plugin_dir = PLUGIN_DIR if os.path.basename(PLUGIN_DIR) == "beam.cast" else ""
+    files = {
+        "helpers": any(os.path.exists(dest) for _, dest, _ in system_files()),
+        "plugin": bool(plugin_dir),
+    }
+    for path in (LIB_DIR, STATE_DIR, DATA_DIR, os.path.dirname(DOUBLETAKE_CREDS)):
+        files[path] = os.path.exists(path)
+    record = read_record()
+    steps = uninstall_plan(record, all_packages, files, required_by_others)
+
+    casting = bool(doubletake_processes())
+    fw = read_firewall().get("host")
+    print("Beam uninstall will:")
+    if casting:
+        print("  - Stop the cast")
+    if fw:
+        print(f"  - Close the firewall opening for {fw}")
+    for desc, _ in steps:
+        print("  -", desc)
+    if not record.get("packages") and not all_packages:
+        print("  (Setup didn't install any packages here. Add --all-packages to also offer\n"
+              "   removing the casting packages that nothing else needs.)")
+    if dry:
+        return
+    if not yes:
+        try:
+            if input("Continue? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("Nothing changed.")
+                return
+        except EOFError:
+            print("No answer; nothing changed. Use --yes to skip the question.")
+            sys.exit(1)
+
+    if casting:
+        stop_cast()
+        time.sleep(1.5)  # the cast's watcher closes the firewall as it exits
+    if read_firewall().get("host"):
+        ok, msg = firewall_close()
+        print("  firewall:", msg)
+    for desc, cmd in steps:
+        if cmd:
+            print("+", cmd)
+            if subprocess.call(cmd, shell=True) != 0:
+                print(f"  failed; continuing ({desc})")
+    for path in (LIB_DIR, STATE_DIR, DATA_DIR, os.path.dirname(DOUBLETAKE_CREDS)):
+        shutil.rmtree(path, ignore_errors=True)
+    if plugin_dir:
+        # Last, since it deletes this script; Python has already read it.
+        subprocess.call(["omarchy", "plugin", "remove", "beam.cast", "--yes"])
+        parent = os.path.dirname(plugin_dir)
+        for name in os.listdir(parent):
+            if name.startswith(".beam.cast.bak."):
+                shutil.rmtree(os.path.join(parent, name), ignore_errors=True)
+    print("Beam is uninstalled.")
 
 
 def main():
@@ -1026,6 +1215,8 @@ def main():
         cmd_install_doubletake()
     elif cmd == "setup":
         cmd_setup()
+    elif cmd == "uninstall":
+        cmd_uninstall(rest)
     elif cmd == "start":
         cmd_start(rest)
     elif cmd == "stop":

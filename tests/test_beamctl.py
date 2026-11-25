@@ -324,6 +324,50 @@ class SourceHandover(unittest.TestCase):
         self.assertFalse(beamctl.handed_over(200, {"pid": 200, "handoverFrom": 100}))
 
 
+class UninstallPlan(unittest.TestCase):
+    """Uninstall undoes what setup recorded, and never removes what others need."""
+
+    @staticmethod
+    def required(table):
+        return lambda pkg, removing: table.get(pkg)
+
+    def plan(self, record, all_packages=False, files=None, table=None):
+        return beamctl.uninstall_plan(record, all_packages, files or {}, self.required(table or {}))
+
+    def test_nothing_recorded_touches_no_packages(self):
+        steps = self.plan({}, table={"gst-libav": ([], [])})
+        self.assertFalse(any("pacman" in (c or "") for _, c in steps))
+
+    def test_recorded_packages_are_removed(self):
+        steps = self.plan({"packages": ["gst-libav", "gst-plugin-va"]},
+                          table={"gst-libav": ([], []), "gst-plugin-va": ([], ["obs"])})
+        cmds = [c for _, c in steps if c]
+        self.assertIn("sudo pacman -Rsu gst-libav gst-plugin-va", cmds)
+        self.assertTrue(any("optional for obs" in d for d, _ in steps))
+
+    def test_packages_others_need_are_kept(self):
+        steps = self.plan({"packages": ["libpulse"]}, table={"libpulse": (["chromium"], [])})
+        self.assertFalse(any(c for _, c in steps if c and "pacman" in c))
+        self.assertTrue(any("Keep libpulse: needed by chromium" in d for d, _ in steps))
+
+    def test_all_packages_adds_the_casting_set(self):
+        table = {p: ([], []) for p in beamctl.REQUIRED_PACKAGES}
+        steps = self.plan({}, all_packages=True, table=table)
+        cmd = next(c for _, c in steps if c and "pacman" in c)
+        for p in beamctl.REQUIRED_PACKAGES:
+            self.assertIn(p, cmd.split())
+
+    def test_avahi_only_turned_off_if_setup_turned_it_on(self):
+        self.assertFalse(any("avahi" in (c or "") for _, c in self.plan({})))
+        self.assertTrue(any("disable --now avahi-daemon" in (c or "") for _, c in self.plan({"avahiEnabled": True})))
+
+    def test_helpers_removed_when_present(self):
+        steps = self.plan({}, files={"helpers": True})
+        cmd = next(c for _, c in steps if c)
+        self.assertIn("/usr/local/libexec/beam/beam-firewall-open", cmd)
+        self.assertIn(beamctl.POLICY_PATH, cmd)
+
+
 class LogState(unittest.TestCase):
     LIVE = """2026/11/25 12:35:09 connected to: Apple TV (model: AppleTV3,2, initialVolume: unavailable, volumeControlType: 0)
 2026/11/25 12:35:09 pairing complete

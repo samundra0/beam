@@ -38,5 +38,6 @@
   "firewall.close": "Close firewall",
   "options.askSource": "Ask what to share each time",
   "screens.choose": "Source…",
-  "state.changingSource": "Reconnecting… pick what to share"
+  "state.changingSource": "Reconnecting… pick what to share",
+  "uninstall": "Uninstall Beam…"
 }
