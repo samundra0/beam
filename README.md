@@ -6,6 +6,7 @@ panels such as Horion — from a button in the bar.
 
 - **Finds the screens** on your network by itself.
 - **Share a display, one window or a region**, and switch mid-cast.
+- **Mirror, or extend**: use the screen as a second desktop.
 - **Sets itself up**: one terminal, one password, done.
 - **Opens the firewall only while casting, and only for that one screen.**
 - **Uninstalls cleanly**, undoing exactly what setup changed.
@@ -45,15 +46,30 @@ again. From a terminal: `~/.config/omarchy/plugins/beam.cast/beamctl setup`.
    It's remembered for next time.
 5. **Stop** in the panel, or right-click the bar icon, ends the cast.
 
-**Source…** picks what to share. Before a cast it casts with the picker; during
-a cast it restarts the cast with the picker so you can share something else
-(the screen goes blank for a couple of seconds).
+While casting, the button turns into **Source…** (plus **Stop**): it restarts
+the cast with the picker so you can share something else (the screen goes blank
+for a couple of seconds).
+
+### Extend instead of mirror
+
+The **⌄** next to **Cast** switches between **Cast (mirror)** and **Extend**;
+the choice is remembered and the button reads **Extend**. Extending:
+
+1. creates a virtual monitor, `BEAM-1`, at the screen's own resolution
+   (as the screen reports it), to the right of your display;
+2. shows the picker: choose **BEAM-1**;
+3. the screen becomes a second desktop — move the mouse past the right edge,
+   drag windows over (Super + drag), or open apps there;
+4. when the cast ends, `BEAM-1` is removed and its windows come back.
+
+Nothing is written to your Hyprland config. Extend needs Hyprland.
 
 | Setting | What it does |
 |---|---|
 | Send sound to the screen | Routes your sound to the screen while casting, and puts your speakers back when you stop. See [known limitations](#known-limitations) |
 | Show the mouse cursor | Turn off to hide the pointer on the screen |
 | Ask what to share each time | Show the picker on every **Cast**. Off: reuse the last choice |
+| Show Macs as screens | Macs can receive AirPlay, but on shared networks they're usually other people's laptops, so they're hidden by default |
 
 Keyboard: arrow keys move between screens, Enter casts or stops, Esc closes.
 
@@ -62,7 +78,8 @@ Keyboard: arrow keys move between screens, Enter casts or stops, Esc closes.
 Anything that advertises AirPlay on the network (`_airplay._tcp` /
 `_raop._tcp` over mDNS) and can show a mirrored screen. Speakers — HomePods,
 AirPort Express, Sonos and other audio-only receivers — are hidden
-(`beamctl discover --all` shows them).
+(`beamctl discover --all` shows them), and so are Macs unless *Show Macs as
+screens* is on.
 
 Tested on a Horion panel, both on its own hotspot and on a shared office
 Wi-Fi. Other AirPlay screens use the same protocol and should work.
@@ -75,9 +92,11 @@ the one that answers.
 
 ## Known limitations
 
-- **No sound on Horion panels yet.** Your sound is routed and sent, but the
-  panel plays nothing; this is being investigated. Video works.
-- **Mirroring only.** Using the screen as a second, extended desktop is planned.
+- **No sound on Horion panels.** Sound is captured and sent (AAC-ELD and ALAC
+  were both tried) and the panel accepts the stream, but plays nothing. Video
+  works. Other AirPlay screens may well play it.
+- The extended desktop's monitor has to be picked by hand (**BEAM-1**) in the
+  picker.
 - English only, so far.
 
 ## What Beam changes on your system
@@ -143,10 +162,10 @@ The cast's log is at `~/.local/state/beam/cast.log`.
 except `setup` and `uninstall`, which are meant for people.
 
 ```sh
-beamctl discover [--all]              # screens, and the port that answers
+beamctl discover [--macs] [--all]     # screens, and the port that answers
 beamctl doctor                        # setup checks and the commands that fix them
 beamctl setup                         # set up this machine
-beamctl start HOST PORT [--device-id ID] [--name NAME] [--audio] [--no-cursor] [--choose] [--code PIN]
+beamctl start HOST PORT [--device-id ID] [--name NAME] [--audio] [--no-cursor] [--choose] [--extend] [--debug] [--code PIN]
 beamctl change-source                 # restart the running cast with the picker
 beamctl status                        # idle / connecting / pairing / live / failed
 beamctl stop

@@ -4,6 +4,7 @@ import Quickshell.Io
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
+import QtQuick.Controls as QQC
 
 // Beam: cast the screen to an AirPlay display. All the work happens in the
 // beamctl helper beside this file, which answers every command with JSON;
@@ -37,6 +38,8 @@ Panel {
   readonly property bool sound: setting("sound", true) === true
   readonly property bool showCursor: setting("cursor", true) === true
   readonly property bool askSource: setting("askSource", true) === true
+  readonly property bool extend: setting("extend", false) === true
+  readonly property bool showMacs: setting("showMacs", false) === true
   readonly property string targetLabel: {
     var host = String(status.host || "")
     for (var i = 0; i < devices.length; i++)
@@ -52,7 +55,9 @@ Panel {
     if (pendingAction === "firewall-close") return strings.t("state.closingFirewall")
     if (pendingAction === "change-source") return strings.t("state.changingSource")
     if (castState === "live")
-      return status.external ? strings.t("state.liveExternal").arg(targetLabel) : strings.t("state.live").arg(targetLabel)
+      return status.external ? strings.t("state.liveExternal").arg(targetLabel)
+           : status.extend ? strings.t("state.extending").arg(targetLabel)
+           : strings.t("state.live").arg(targetLabel)
     if (castState === "connecting") return strings.t("state.connecting")
     if (castState === "pairing") return strings.t("state.pairing")
     if (castState === "failed") return strings.t("state.failed")
@@ -88,6 +93,7 @@ Panel {
     if (sound) args.push("--audio")
     if (!showCursor) args.push("--no-cursor")
     if (askSource || choose) args.push("--choose")
+    if (extend) args.push("--extend")
     if (code) args.push("--code", code)
     runAction(args)
   }
@@ -173,7 +179,7 @@ Panel {
 
   Process {
     id: discoverProc
-    command: ["python3", root.helper, "discover"]
+    command: ["python3", root.helper, "discover"].concat(root.showMacs ? ["--macs"] : [])
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -341,6 +347,18 @@ Panel {
             : root.network && root.network.ip
               ? strings.t("network.wired").arg(String(root.network.iface || "")).arg(String(root.network.ip))
               : strings.t("network.none")
+        }
+
+        // The picker can't be told which monitor to offer first, so say it.
+        Label {
+          visible: root.extend && (root.pendingAction === "start" || root.pendingAction === "change-source"
+                                   || root.castState === "connecting")
+          width: parent.width
+          wrapMode: Text.Wrap
+          elide: Text.ElideNone
+          color: Commons.Color.accent
+          font.pixelSize: Style.font.bodySmall
+          text: strings.t("extend.hint")
         }
 
         // ---------- Firewall ----------
@@ -528,7 +546,7 @@ Panel {
               id: rowContent
               anchors.left: parent.left
               anchors.leftMargin: Style.space(8)
-              anchors.right: chooseButton.left
+              anchors.right: sourceButton.visible ? sourceButton.left : castButton.left
               anchors.rightMargin: Style.space(8)
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(2)
@@ -548,27 +566,30 @@ Panel {
               }
             }
 
+            // While this screen is being cast to: [Source…] [Stop].
             Button {
-              id: chooseButton
+              id: sourceButton
+              visible: row.current
               anchors.right: castButton.left
               anchors.rightMargin: Style.space(6)
               anchors.verticalCenter: parent.verticalCenter
-              text: strings.t("screens.choose")
-              // Idle: cast with the picker. Casting here: restart this cast with
-              // the picker to share something else.
-              enabled: !actionProc.running && (row.current || (!root.casting && row.modelData.reachable))
+              text: strings.t("screens.source")
+              enabled: !actionProc.running
               foreground: root.bar.foreground
               fontFamily: root.bar.fontFamily
               bordered: true
-              onClicked: row.current ? root.runAction(["change-source"]) : root.cast(row.modelData, "", true)
+              onClicked: root.runAction(["change-source"])
             }
 
+            // Otherwise a split button: [Cast|▾] mirrors, [Extend|▾] extends;
+            // the ▾ menu switches between the two and remembers the choice.
             Button {
               id: castButton
-              anchors.right: parent.right
-              anchors.rightMargin: Style.space(4)
+              anchors.right: modeButton.visible ? modeButton.left : parent.right
+              anchors.rightMargin: modeButton.visible ? Style.space(2) : Style.space(4)
               anchors.verticalCenter: parent.verticalCenter
-              text: row.current ? strings.t("screens.stop") : strings.t("screens.cast")
+              text: row.current ? strings.t("screens.stop")
+                  : root.extend ? strings.t("screens.extend") : strings.t("screens.cast")
               enabled: row.current || (!root.casting && row.modelData.reachable && !actionProc.running)
               active: row.current
               hasCursor: row.selected
@@ -577,6 +598,58 @@ Panel {
               bordered: true
               onClicked: row.current ? root.stop() : root.cast(row.modelData, "")
               onHovered: function(h) { if (h) { root.cursorActive = true; root.deviceIndex = row.index } }
+            }
+
+            Button {
+              id: modeButton
+              visible: !row.current
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(4)
+              anchors.verticalCenter: parent.verticalCenter
+              text: "\u{F0140}"
+              tooltipText: strings.t("mode.tooltip")
+              enabled: !root.casting && !actionProc.running
+              horizontalPadding: Style.space(6)
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              bordered: true
+              onClicked: modeMenu.opened ? modeMenu.close() : modeMenu.open()
+
+              QQC.Popup {
+                id: modeMenu
+                x: modeButton.width - width
+                y: modeButton.height + Style.space(2)
+                width: Style.space(200)
+                padding: Style.space(4)
+                closePolicy: QQC.Popup.CloseOnPressOutsideParent | QQC.Popup.CloseOnEscape
+                background: Rectangle {
+                  color: Commons.Color.popups.background
+                  border.color: Commons.Color.popups.border
+                  border.width: 1
+                  radius: Style.cornerRadius
+                }
+                contentItem: Column {
+                  spacing: Style.space(2)
+                  Repeater {
+                    model: [{ extend: false, label: strings.t("mode.mirror"), detail: strings.t("mode.mirrorDetail") },
+                            { extend: true, label: strings.t("mode.extend"), detail: strings.t("mode.extendDetail") }]
+                    Button {
+                      required property var modelData
+                      width: modeMenu.availableWidth
+                      leftAlign: true
+                      selected: root.extend === modelData.extend
+                      text: modelData.label
+                      tooltipText: modelData.detail
+                      foreground: Commons.Color.popups.text
+                      fontFamily: root.bar.fontFamily
+                      onClicked: {
+                        if (root.extend !== modelData.extend) root.setOption("extend", modelData.extend)
+                        modeMenu.close()
+                      }
+                    }
+                  }
+                }
+              }
             }
           }
         }
@@ -598,6 +671,11 @@ Panel {
           label: strings.t("options.askSource")
           checked: root.askSource
           onToggled: root.setOption("askSource", !root.askSource)
+        }
+        OptionRow {
+          label: strings.t("options.showMacs")
+          checked: root.showMacs
+          onToggled: { root.setOption("showMacs", !root.showMacs); root.discover() }
         }
 
         // Uninstall runs in a terminal: it asks before changing anything and

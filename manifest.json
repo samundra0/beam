@@ -21,7 +21,9 @@
     "defaults": {
       "sound": true,
       "cursor": true,
-      "askSource": true
+      "askSource": true,
+      "extend": false,
+      "showMacs": false
     },
     "schema": [
       {
@@ -41,6 +43,18 @@
         "type": "boolean",
         "label": "Ask what to share each time",
         "defaultValue": true
+      },
+      {
+        "key": "extend",
+        "type": "boolean",
+        "label": "Extend instead of mirror (also set from the ▾ next to Cast)",
+        "defaultValue": false
+      },
+      {
+        "key": "showMacs",
+        "type": "boolean",
+        "label": "Show Macs as screens",
+        "defaultValue": false
       }
     ]
   }

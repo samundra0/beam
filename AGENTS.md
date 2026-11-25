@@ -8,7 +8,7 @@ the user-facing doc.
 
 | Path | What it is |
 |---|---|
-| `manifest.json` | Plugin manifest (validated by `omarchy plugin validate .`); settings `sound`, `cursor`, `askSource` |
+| `manifest.json` | Plugin manifest (validated by `omarchy plugin validate .`); settings `sound`, `cursor`, `askSource`, `extend` (set from the ⌄ menu), `showMacs` |
 | `Panel.qml` | Bar icon + panel UI. Talks to `beamctl` only through `Process` and JSON |
 | `beamctl` | Python 3, **standard library only**. Every command prints one JSON object, except `setup` and `uninstall`, which are human-readable (people type them) |
 | `i18n/en.json` | UI strings, read through `Commons.Translations` (`strings.t("key")`) |
@@ -29,8 +29,14 @@ per architecture into `~/.local/lib/beam/`. Beam never bundles it.
   doubletake's saved portal pick (`--choose`), launches doubletake detached,
   and spawns `_watch` (closes firewall + restores sound when doubletake exits)
   and `_route-audio`.
-- `change-source`: restarts the cast with the picker; `handoverFrom` in the
-  session stops the old watcher from closing the firewall.
+- `start --extend`: reads the receiver's mode from `GET /info` (`displays[0]`),
+  creates the headless Hyprland output `BEAM-1` at that size, scale 1,
+  `auto-right` (`hyprctl eval 'hl.monitor{…}'` for Lua configs, falling back to
+  `hyprctl keyword monitor`), forces `--choose`; the watcher removes the output
+  when doubletake exits.
+- `change-source`: restarts the cast with the picker (keeping `--extend`);
+  `handoverFrom` in the session stops the old watcher from closing the
+  firewall or removing `BEAM-1`.
 - `setup` / `fix` / `first-run`: install doubletake, run doctor's fix commands
   with sudo, record each change in `~/.local/share/beam/setup.json`.
 - `uninstall`: undoes exactly what that record says, then removes the plugin.
@@ -60,6 +66,12 @@ State: `~/.local/state/beam/` (session.json, firewall.json, cast.log),
   `--internal-audio-output-guard` helper with the same name, which is ignored.
 - `pkill -f <pattern>` matches your own shell's command line; use explicit
   PIDs.
+- **Hyprland here uses a Lua config**: `hyprctl keyword` answers "can't work
+  with non-legacy parsers"; runtime rules go through `hyprctl eval`.
+- The Horion's `/info` resolution changes (1920x1080 earlier, 1600x900 later
+  the same day); always read it at cast time.
+- Macs are real AirPlay receivers (`model=MacBookPro18,1`…); `is_mac` hides
+  them unless `--macs`.
 
 ## Testing without touching the real machine
 
@@ -89,16 +101,18 @@ screen, their sudo password, or both.
 - Release: bump `version` in `manifest.json`, tag `vX.Y.Z`, push the tag,
   `gh release create`.
 
-## Open items (after v1.0.0)
+## Open items
 
-- **Sound doesn't play on the Horion.** Laptop-side routing works (default
-  sink → `doubletake`, captured from its monitor). Suspects: doubletake picks
-  AAC-ELD (Horion advertises feature bits 18–21 and libfdk-aac is installed)
-  and the panel can't play it, or doubletake's initial-volume heuristics
-  (Horion reports no `initialVolume`). Next step: a `-debug` cast while the
-  user listens; the pedrocarv/airplay-mirror fork's
-  `-preserve-receiver-volume` is a lead.
-- **Extended display.** Plan: `hyprctl output create headless`, set it to the
-  receiver's mode, cast that output (pick it in the portal picker), remove it
-  when the cast ends. jonspinks/omarchy-airplay does this for AirPlay 2.
+- **Sound doesn't play on the Horion** (parked). Tested with `--debug` and a
+  test tone into the `doubletake` sink: frames are sent, the receiver accepts
+  the audio SETUP, volume is the receiver's own −21 dB, and both AAC-ELD
+  (`ct=8`) and ALAC (`ct=2`, forced by putting an empty `libfdk-aac.so.2` on
+  `LD_LIBRARY_PATH`) are silent. ufw isn't blocking doubletake's sockets. Next:
+  check whether the Horion plays sound when an iPhone/Mac mirrors to it; if it
+  does, report to doubletake with the debug log.
+- **Extend picks by hand**: the portal picker can't be told to preselect
+  `BEAM-1`. Possible route: xdg-desktop-portal-hyprland's custom picker hook.
+- **Not tied to Omarchy**: `beamctl` should detect firewall, terminal and
+  polkit instead of assuming Omarchy, so a standalone app or other shells
+  (e.g. Caelestia on CachyOS) can use it.
 - Only English strings ship; no translations yet.

@@ -34,9 +34,18 @@
   "firewall.stale": "The firewall is still open for %1 from an earlier cast.",
   "firewall.close": "Close firewall",
   "options.askSource": "Ask what to share each time",
-  "screens.choose": "Source…",
   "state.changingSource": "Reconnecting… pick what to share",
   "uninstall": "Uninstall Beam…",
   "setup.run": "Set up Beam",
-  "setup.running": "Setting up… finish in the terminal"
+  "setup.running": "Setting up… finish in the terminal",
+  "options.showMacs": "Show Macs as screens",
+  "state.extending": "Extending to %1",
+  "extend.hint": "In the picker, choose the monitor BEAM-1: that's the screen's new desktop, to the right of yours.",
+  "screens.source": "Source…",
+  "screens.extend": "Extend",
+  "mode.tooltip": "Mirror or extend",
+  "mode.mirror": "Cast (mirror)",
+  "mode.mirrorDetail": "Show your screen, a window or a region",
+  "mode.extend": "Extend",
+  "mode.extendDetail": "Use the screen as a second desktop, to the right of yours"
 }

@@ -6,8 +6,8 @@ to them, and starts or stops a doubletake mirroring session. Every command
 prints one JSON object on stdout, so the QML side never parses free text.
 
 Commands:
-  discover [--all]             list AirPlay screens with the port that answers RTSP
-                               (--all also lists audio-only receivers such as speakers)
+  discover [--all] [--macs]    list AirPlay screens with the port that answers RTSP
+                               (--macs also lists Macs, --all also audio-only receivers)
   doctor                       check packages, services, firewall and the doubletake binary
   fix                          open a terminal that runs the fix commands doctor suggests
   install-doubletake           download the pinned doubletake release into ~/.local/lib/beam
@@ -16,7 +16,9 @@ Commands:
                                undo everything Beam set up and remove the plugin (asks for sudo);
                                --all-packages also offers the casting packages setup didn't install
   start HOST PORT [options]    start casting (--device-id ID --name NAME --audio --no-cursor --code PIN
-                               --choose: show the screen-share picker again instead of reusing the last pick)
+                               --choose: show the screen-share picker again instead of reusing the last pick
+                               --debug: verbose doubletake log in cast.log
+                               --extend: cast a new virtual monitor (Hyprland), an extended desktop)
   stop                         stop the cast and put the previous sound output back
   change-source                restart the running cast with the screen-share picker, keeping
                                the firewall rule and sound routing (a ~2 s reconnect on the screen)
@@ -25,6 +27,7 @@ Commands:
 """
 
 import concurrent.futures
+import plistlib
 import hashlib
 import ipaddress
 import json
@@ -198,12 +201,22 @@ def group_receivers(airplay, raop):
                 cands.append(p)
         d["candidates"] = cands
         d["screen"] = is_screen(d)
+        d["mac"] = is_mac(d)
         out.append(d)
     return sorted(out, key=lambda d: d["name"].lower())
 
 
 # Models that only ever play sound: HomePods and AirPort Express base stations.
 AUDIO_ONLY_MODELS = ("AudioAccessory", "AirPort")
+
+
+# Macs receive AirPlay too (macOS's AirPlay Receiver), but on a shared network
+# they are usually other people's laptops, so they are hidden unless asked for.
+COMPUTER_MODELS = ("Mac", "iMac")
+
+
+def is_mac(d):
+    return d.get("model", "").startswith(COMPUTER_MODELS)
 
 
 def is_screen(d):
@@ -239,6 +252,103 @@ def probe_rtsp(host, port, timeout=1.5):
         return False
 
 
+def fetch_info(host, port, timeout=3):
+    """The receiver's GET /info plist (a dict), or {} if it won't say."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            s.sendall(b"GET /info RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: AirPlay/220.68\r\n\r\n")
+            data = b""
+            while b"\r\n\r\n" not in data and len(data) < 65536:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            head, _, body = data.partition(b"\r\n\r\n")
+            m = re.search(rb"content-length:\s*(\d+)", head, re.I)
+            length = min(int(m.group(1)), 1 << 20) if m else 0
+            while len(body) < length:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                body += chunk
+        info = plistlib.loads(body[:length]) if length else {}
+        return info if isinstance(info, dict) else {}
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return {}
+
+
+def receiver_mode(info):
+    """(width, height, fps) the receiver shows, from its /info; 1080p30 if unknown."""
+    width, height, fps = 1920, 1080, 30
+    displays = info.get("displays") if isinstance(info, dict) else None
+    if isinstance(displays, list) and displays and isinstance(displays[0], dict):
+        d = displays[0]
+        w = d.get("widthPixels") or d.get("width")
+        h = d.get("heightPixels") or d.get("height")
+        if isinstance(w, int) and isinstance(h, int) and 320 <= w <= 7680 and 240 <= h <= 4320:
+            width, height = w, h
+        f = d.get("maxFPS")
+        if isinstance(f, int) and 1 <= f <= 120:
+            fps = f
+    return width, height, fps
+
+
+# ------------------------------------------------------------------- extend
+# An extended desktop is a headless Hyprland output sized to the receiver,
+# placed right of the existing screens and cast like any other monitor. It is
+# runtime-only: nothing is written to the Hyprland config.
+VIRTUAL_OUTPUT = "BEAM-1"
+
+
+def hyprland_available():
+    return bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")) and bool(shutil.which("hyprctl"))
+
+
+def hypr_monitors():
+    code, out, _ = run(["hyprctl", "monitors", "all", "-j"], timeout=5)
+    try:
+        return json.loads(out) if code == 0 else []
+    except ValueError:
+        return []
+
+
+def monitor_rule_commands(name, width, height, fps):
+    """Ways to set the output's mode: Lua configs (newer Hyprland) take
+    `hyprctl eval`; hyprlang configs take `hyprctl keyword monitor`."""
+    lua = (f'hl.monitor({{ output = "{name}", mode = "{width}x{height}@{fps}", '
+           f'position = "auto-right", scale = 1 }})')
+    return [["hyprctl", "eval", lua],
+            ["hyprctl", "keyword", "monitor", f"{name},{width}x{height}@{fps},auto-right,1"]]
+
+
+def create_virtual_output(width, height, fps, name=VIRTUAL_OUTPUT):
+    """Create (or reuse) the headless output and give it the receiver's mode.
+    Returns (ok, message)."""
+    if not hyprland_available():
+        return False, "extended desktop needs Hyprland"
+    if not any(m.get("name") == name for m in hypr_monitors()):
+        code, out, err = run(["hyprctl", "output", "create", "headless", name], timeout=5)
+        if code != 0 or "ok" not in out:
+            return False, (out + err).strip() or "hyprctl output create failed"
+    for cmd in monitor_rule_commands(name, width, height, fps):
+        code, out, _ = run(cmd, timeout=5)
+        if code == 0 and out.strip() == "ok":
+            break
+    time.sleep(0.5)
+    for m in hypr_monitors():
+        if m.get("name") == name:
+            if (m.get("width"), m.get("height")) == (width, height) and m.get("scale") == 1:
+                return True, f"{name} {width}x{height}@{fps}"
+            return True, f"{name} created, but its mode is {m.get('width')}x{m.get('height')} scale {m.get('scale')}"
+    return False, f"{name} did not appear"
+
+
+def remove_virtual_output(name=VIRTUAL_OUTPUT):
+    if any(m.get("name") == name for m in hypr_monitors()):
+        run(["hyprctl", "output", "remove", name], timeout=5)
+
+
 def browse(service, timeout=8):
     code, out, _ = run(["avahi-browse", "-rptk", service], timeout=timeout)
     return [r for r in (parse_avahi_line(l) for l in out.splitlines()) if r]
@@ -267,12 +377,13 @@ def network_info():
     return info
 
 
-def cmd_discover(show_all=False):
+def cmd_discover(show_all=False, show_macs=False):
     with concurrent.futures.ThreadPoolExecutor(4) as pool:
         fa = pool.submit(browse, "_airplay._tcp")
         fr = pool.submit(browse, "_raop._tcp")
         fn = pool.submit(network_info)
-        devices = [d for d in group_receivers(fa.result(), fr.result()) if show_all or d["screen"]]
+        devices = [d for d in group_receivers(fa.result(), fr.result())
+                   if show_all or (d["screen"] and (show_macs or not d["mac"]))]
 
         def resolve(d):
             d["port"], d["reachable"] = (d["candidates"][0] if d["candidates"] else 7000), False
@@ -738,7 +849,11 @@ def cmd_watch(pid):
         time.sleep(1)
     if handed_over(pid, read_session()):
         return
-    restore_sink(read_session().get("prevSink", ""))
+    sess = read_session()
+    if sess.get("extend"):
+        # Windows on it move back to the remaining screens.
+        remove_virtual_output(sess["extend"])
+    restore_sink(sess.get("prevSink", ""))
     firewall_close()
 
 
@@ -778,6 +893,10 @@ def cmd_change_source():
         argv.append("--audio")
     if sess.get("cursor") is False:
         argv.append("--no-cursor")
+    if sess.get("debug"):
+        argv.append("--debug")
+    if sess.get("extend"):
+        argv.append("--extend")
     # The old cast's doubletake output is gone now, so the default sink is not
     # the one to put back later: carry the original over.
     os.environ["BEAM_PREV_SINK"] = sess.get("prevSink", "")
@@ -883,7 +1002,7 @@ def cmd_status():
               "name": sess.get("name", ""), "host": sess.get("host", ""), "port": sess.get("port"),
               "audio": sess.get("audio", False), "needsCode": info["needsCode"],
               "lastError": info["lastError"], "log": "\n".join(log.splitlines()[-30:]),
-              "firewall": firewall_status(True)})
+              "firewall": firewall_status(True), "extend": sess.get("extend", "")})
 
     failed = bool(sess and log and not info["ended"] and (info["lastError"] or info["needsCode"]))
     recent = time.time() - float(sess.get("startedAt", 0) or 0) < 120
@@ -952,6 +1071,8 @@ def cmd_start(argv):
     ap.add_argument("--no-cursor", action="store_true")
     ap.add_argument("--code", default="")
     ap.add_argument("--choose", action="store_true")
+    ap.add_argument("--debug", action="store_true", help="pass -debug to doubletake (verbose cast.log)")
+    ap.add_argument("--extend", action="store_true", help="cast a new virtual monitor instead of mirroring")
     a = ap.parse_args(argv)
 
     try:
@@ -985,6 +1106,16 @@ def cmd_start(argv):
     if not ok:
         emit({"ok": False, "error": "The firewall wasn't opened for the screen, so the cast didn't start: " + msg}, 1)
 
+    extend_msg = ""
+    if a.extend:
+        width, height, fps = receiver_mode(fetch_info(a.host, a.port))
+        ok, extend_msg = create_virtual_output(width, height, fps)
+        if not ok:
+            emit({"ok": False, "error": "Couldn't create the extended desktop: " + extend_msg}, 1)
+        # The saved pick names an existing monitor, never the new one, so an
+        # extended cast always asks; the user picks BEAM-1.
+        a.choose = True
+
     removed = forget_share_choice(a.device_id) if a.choose else 0
 
     args = [dt, "-target", a.host, "-port", str(a.port), "-port-range", PORT_RANGE]
@@ -993,6 +1124,8 @@ def cmd_start(argv):
     args += ["-audio-source", "output"] if a.audio else ["-no-audio"]
     if a.no_cursor:
         args.append("-no-cursor")
+    if a.debug:
+        args.append("-debug")
     if a.code:
         args.append("-pair")
 
@@ -1022,7 +1155,8 @@ def cmd_start(argv):
     write_session({"pid": p.pid, "host": a.host, "port": a.port, "name": a.name,
                    "deviceId": a.device_id, "audio": a.audio, "prevSink": prev_sink,
                    "startedAt": time.time(), "choose": a.choose, "picksRemoved": removed,
-                   "cursor": not a.no_cursor, "handoverFrom": int(handover) if handover.isdigit() else None})
+                   "cursor": not a.no_cursor, "debug": a.debug,
+                   "extend": VIRTUAL_OUTPUT if a.extend else "", "handoverFrom": int(handover) if handover.isdigit() else None})
 
     helper = [sys.executable, os.path.realpath(__file__)]
     quiet = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -1030,7 +1164,8 @@ def cmd_start(argv):
     if a.audio:
         subprocess.Popen(helper + ["_route-audio", str(p.pid)], **quiet)
     subprocess.Popen(helper + ["_watch", str(p.pid)], **quiet)
-    emit({"ok": True, "pid": p.pid, "args": args[1:], "firewall": msg})
+    emit({"ok": True, "pid": p.pid, "args": args[1:], "firewall": msg,
+          **({"extend": extend_msg} if a.extend else {})})
 
 
 def cmd_route_audio(pid):
@@ -1224,7 +1359,7 @@ def main():
         return
     cmd, rest = argv[0], argv[1:]
     if cmd == "discover":
-        cmd_discover("--all" in rest)
+        cmd_discover("--all" in rest, "--macs" in rest)
     elif cmd == "doctor":
         cmd_doctor()
     elif cmd == "fix":

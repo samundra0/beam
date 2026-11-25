@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import socket
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -403,6 +404,115 @@ class FirstRun(unittest.TestCase):
         self.ok = True
         self.assertFalse(self.run_first()["launched"])
         self.assertEqual(self.opened, [])
+
+
+class MacFilter(unittest.TestCase):
+    def test_macs_are_flagged(self):
+        p = beamctl.parse_avahi_line
+        line = airplay_line("Someone MacBook", "MacBookPro18,1", "0x4A7FCFD5,0x38174FDE")
+        [d] = beamctl.group_receivers([p(line)], [])
+        self.assertTrue(d["mac"])
+        self.assertTrue(d["screen"])  # a real receiver, just hidden by default
+        [h] = beamctl.group_receivers([p(HORION_AIRPLAY)], [])
+        self.assertFalse(h["mac"])
+
+    def test_mac_models(self):
+        for model, mac in (("Mac16,10", True), ("iMac21,1", True), ("MacBookAir10,1", True),
+                           ("AppleTV14,1", False), ("UN55TU8300", False)):
+            self.assertEqual(beamctl.is_mac({"model": model}), mac, model)
+
+
+class ReceiverInfo(unittest.TestCase):
+    def serve(self, body):
+        """A one-shot fake receiver answering GET /info with body."""
+        import threading
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+
+        def answer():
+            conn, _ = srv.accept()
+            conn.recv(1024)
+            conn.sendall(b"RTSP/1.0 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+            conn.close()
+            srv.close()
+        threading.Thread(target=answer, daemon=True).start()
+        return srv.getsockname()[1]
+
+    def test_reads_display_mode_from_binary_plist(self):
+        import plistlib
+        body = plistlib.dumps({"model": "AppleTV3,2", "displays": [
+            {"widthPixels": 1600, "heightPixels": 900, "maxFPS": 30}]}, fmt=plistlib.FMT_BINARY)
+        info = beamctl.fetch_info("127.0.0.1", self.serve(body))
+        self.assertEqual(beamctl.receiver_mode(info), (1600, 900, 30))
+
+    def test_unknown_falls_back_to_1080p30(self):
+        self.assertEqual(beamctl.receiver_mode({}), (1920, 1080, 30))
+        self.assertEqual(beamctl.receiver_mode({"displays": [{"widthPixels": 99999}]}), (1920, 1080, 30))
+
+    def test_unreachable_receiver_gives_empty_info(self):
+        self.assertEqual(beamctl.fetch_info("127.0.0.1", 9, timeout=0.5), {})
+
+
+class VirtualOutput(unittest.TestCase):
+    """The extended desktop, against a fake hyprctl."""
+
+    def setUp(self):
+        self.saved = (beamctl.run, beamctl.hyprland_available, beamctl.time.sleep)
+        self.monitors = [{"name": "eDP-1", "width": 1920, "height": 1200, "scale": 1.2}]
+        self.calls = []
+        self.lua = True
+
+        def fake_run(cmd, timeout=10):
+            self.calls.append(cmd)
+            if cmd[:3] == ["hyprctl", "monitors", "all"]:
+                return 0, json.dumps(self.monitors), ""
+            if cmd[:4] == ["hyprctl", "output", "create", "headless"]:
+                self.monitors.append({"name": cmd[4], "width": 1920, "height": 1080, "scale": 2})
+                return 0, "ok", ""
+            if cmd[:3] == ["hyprctl", "output", "remove"]:
+                self.monitors = [m for m in self.monitors if m["name"] != cmd[3]]
+                return 0, "ok", ""
+            if cmd[1] in ("eval", "keyword"):
+                if (cmd[1] == "eval") != self.lua:
+                    return 0, "keyword can't work with non-legacy parsers. Use eval.", ""
+                m = self.monitors[-1]
+                m.update(width=1600, height=900, scale=1)
+                return 0, "ok", ""
+            return 1, "", "unexpected"
+        beamctl.run = fake_run
+        beamctl.hyprland_available = lambda: True
+        beamctl.time.sleep = lambda s: None
+
+    def tearDown(self):
+        beamctl.run, beamctl.hyprland_available, beamctl.time.sleep = self.saved
+
+    def test_creates_sized_output_with_lua_config(self):
+        ok, msg = beamctl.create_virtual_output(1600, 900, 30)
+        self.assertTrue(ok, msg)
+        self.assertEqual(msg, "BEAM-1 1600x900@30")
+        self.assertIn('mode = "1600x900@30"', next(c for c in self.calls if c[1] == "eval")[2])
+
+    def test_falls_back_to_keyword_for_hyprlang(self):
+        self.lua = False
+        ok, msg = beamctl.create_virtual_output(1600, 900, 30)
+        self.assertTrue(ok, msg)
+        self.assertIn(["hyprctl", "keyword", "monitor", "BEAM-1,1600x900@30,auto-right,1"], self.calls)
+
+    def test_reuses_existing_output(self):
+        beamctl.create_virtual_output(1600, 900, 30)
+        beamctl.create_virtual_output(1600, 900, 30)
+        creates = [c for c in self.calls if c[:3] == ["hyprctl", "output", "create"]]
+        self.assertEqual(len(creates), 1)
+
+    def test_remove(self):
+        beamctl.create_virtual_output(1600, 900, 30)
+        beamctl.remove_virtual_output()
+        self.assertEqual([m["name"] for m in self.monitors], ["eDP-1"])
+
+    def test_needs_hyprland(self):
+        beamctl.hyprland_available = lambda: False
+        self.assertFalse(beamctl.create_virtual_output(1920, 1080, 30)[0])
 
 
 class LogState(unittest.TestCase):
