@@ -15,7 +15,7 @@ works with receivers that other Linux senders can't connect to.
 On Omarchy:
 
 ```sh
-omarchy plugin add https://github.com/<you>/beam.git --enable
+omarchy plugin add https://github.com/samundra0/beam.git --enable
 ```
 
 Then click the cast icon in the bar. The **Setup** section lists anything
