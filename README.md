@@ -165,6 +165,7 @@ except `setup` and `uninstall`, which are meant for people.
 beamctl discover [--macs] [--all]     # screens, and the port that answers
 beamctl doctor                        # setup checks and the commands that fix them
 beamctl setup                         # set up this machine
+beamctl install-doubletake            # only download doubletake (no sudo)
 beamctl start HOST PORT [--device-id ID] [--name NAME] [--audio] [--no-cursor] [--choose] [--extend] [--debug] [--code PIN]
 beamctl change-source                 # restart the running cast with the picker
 beamctl status                        # idle / connecting / pairing / live / failed
@@ -178,11 +179,24 @@ outside Beam shows as live in the bar too, and **Stop** ends it.
 
 ## Update, disable, uninstall
 
+### Update
+
 ```sh
 omarchy plugin update beam.cast       # latest version
-omarchy plugin disable beam.cast      # hide from the bar, keep everything
+omarchy restart shell                 # load the new panel; the shell keeps showing the old one until then
+```
+
+### Disable
+
+```sh
+omarchy plugin disable beam.cast      # hide from the bar; everything stays installed
 omarchy plugin enable beam.cast       # bring it back
 ```
+
+A cast runs on its own, so disabling doesn't stop one: stop it first, or run
+`~/.config/omarchy/plugins/beam.cast/beamctl stop`.
+
+### Uninstall
 
 **Uninstall Beam…** at the bottom of the panel opens a terminal that lists
 every step and asks first. Or:
@@ -192,10 +206,19 @@ every step and asks first. Or:
 ~/.config/omarchy/plugins/beam.cast/beamctl uninstall
 ```
 
-It stops any cast and closes its firewall rule, removes the helpers, turns
-avahi off **only if setup turned it on**, removes the packages **setup
-installed** (with `pacman -Rsu`, so anything another app needs stays), deletes
-the files listed above, and removes the plugin.
+It:
+
+- stops any cast, closes its firewall rule and removes the `BEAM-1`
+  extended-desktop monitor if there is one;
+- removes the firewall helpers and their polkit policy;
+- turns avahi off **only if setup turned it on**;
+- removes the packages **setup installed** (with `pacman -Rsu`, so anything
+  another app needs stays);
+- deletes the [files listed above](#files), including doubletake's pairings;
+- removes the plugin from the bar (and the backup copy Omarchy keeps).
+
+Re-installing afterwards starts from scratch: setup runs again and screens
+may ask to pair again.
 
 Packages you had before setup are left alone. `--all-packages` also offers the
 casting packages no other app requires, notes which apps use them optionally,

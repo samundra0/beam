@@ -1308,9 +1308,12 @@ def cmd_uninstall(argv):
 
     casting = bool(doubletake_processes())
     fw = read_firewall().get("host")
+    virtual = hyprland_available() and any(m.get("name") == VIRTUAL_OUTPUT for m in hypr_monitors())
     print("Beam uninstall will:")
     if casting:
         print("  - Stop the cast")
+    if virtual:
+        print(f"  - Remove the extended-desktop monitor {VIRTUAL_OUTPUT}")
     if fw:
         print(f"  - Close the firewall opening for {fw}")
     for desc, _ in steps:
@@ -1332,6 +1335,10 @@ def cmd_uninstall(argv):
     if casting:
         stop_cast()
         time.sleep(1.5)  # the cast's watcher closes the firewall as it exits
+    if virtual:
+        # Done here rather than left to the watcher, which reads the session
+        # file this command is about to delete.
+        remove_virtual_output()
     if read_firewall().get("host"):
         ok, msg = firewall_close()
         print("  firewall:", msg)
